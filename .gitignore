@@ -1,0 +1,5 @@
+node_modules/
+data/
+bridge-secret.txt
+.env
+npm-debug.log*

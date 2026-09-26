@@ -1,0 +1,17 @@
+{
+  "name": "kero-whatsapp-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "postinstall": "patch-package && node scripts/fix-ack.mjs"
+  },
+  "dependencies": {
+    "baileys": "7.0.0-rc14",
+    "express": "^5.1.0",
+    "patch-package": "^8.0.1",
+    "pino": "^9.9.0",
+    "qrcode": "^1.5.4"
+  }
+}
