@@ -63,6 +63,21 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+async function resolveStoredLids() {
+  if (!sock?.signalRepository?.lidMapping) return 0;
+  const lids = Object.keys(CRM.state.chats || {}).filter(jid => jid.endsWith('@lid'));
+  let total = 0;
+  for (let i = 0; i < lids.length; i += 100) {
+    const batch = lids.slice(i, i + 100);
+    const mappings = await sock.signalRepository.lidMapping.getPNsForLIDs(batch).catch(() => null);
+    for (const mapping of mappings || []) {
+      CRM.upsertLidMapping(mapping);
+      total++;
+    }
+  }
+  return total;
+}
+
 async function stopSocket() {
   try {
     if (sock?.ws) sock.ws.close();
@@ -150,6 +165,7 @@ async function startSession(mode, phone = null) {
         lastError = null;
         console.log('[wa] connected successfully');
         CRM.syncGroups(sock).then(n => console.log('[crm] groups synced=' + n)).catch(e => console.error('[crm] group sync failed', e?.message || e));
+        setTimeout(() => resolveStoredLids().then(n => console.log('[crm] lid mappings resolved=' + n)).catch(e => console.error('[crm] lid resolve failed', e?.message || e)), 1200);
       }
 
       if (update.connection === 'close') {

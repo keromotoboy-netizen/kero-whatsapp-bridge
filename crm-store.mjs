@@ -354,6 +354,7 @@ export function createCrmStore(dataDir) {
     upsertChat,
     upsertGroup,
     upsertContact,
+    upsertLidMapping,
     upsertPresence,
     snapshot,
     getMessages,

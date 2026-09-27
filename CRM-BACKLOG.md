@@ -1,19 +1,28 @@
 # Kero CRM — fila de implementação
 
-- [x] Conversas em tempo real
-- [x] Responder pelo CRM
-- [x] Aba Arquivados
-- [x] Sincronização de grupos e etiquetas
-- [ ] Sincronizar nomes salvos dos contatos
-- [ ] Mostrar foto de perfil
-- [ ] Enter envia / Shift+Enter quebra linha
-- [ ] Área de conversa com visual claro inspirado no WhatsApp Web
-- [ ] Preservar conteúdo já recebido quando o remetente apagar para todos
-- [ ] Enviar imagem
-- [ ] Enviar arquivo
-- [ ] Enviar áudio / mensagem de voz
-- [ ] Seletor de emojis
-- [ ] Atalhos de formatação (*negrito*, _itálico_, ~riscado~, `monoespaçado`)
-- [ ] Exibir localização recebida
-- [ ] Exibir e atualizar localização ao vivo
-- [ ] Preparar camada futura de IA para atendimento
+## Pronto
+- [x] Conversas em tempo real e resposta pelo CRM
+- [x] Aba Arquivados e eventos de etiquetas
+- [x] Fotos de perfil sob demanda
+- [x] Enter envia / Shift+Enter quebra linha
+- [x] Conversa em tema claro inspirado no WhatsApp
+- [x] Preservar mensagem recebida após "apagar para todos" + aviso
+- [x] Enviar imagem, arquivo e áudio/voz
+- [x] Emoji e formatação *negrito*, _itálico_, ~riscado~
+- [x] Exibir localização recebida
+- [x] Online / digitando / gravando / visto por último quando disponível
+
+## Em andamento
+- [ ] Resolver LID → número para ampliar nomes salvos
+- [ ] Sincronizar estado histórico de grupos e arquivados
+- [ ] Atualizar continuamente localização ao vivo
+- [ ] Melhorar renderização/preview de mídias recebidas
+
+## IA de atendimento
+- [ ] Criar modos Desligada / Sugestões / Automática
+- [ ] Memória curta por conversa
+- [ ] Base de regras da Kero Motoboy
+- [ ] Handoff obrigatório em casos sensíveis
+- [ ] Gerar sugestão antes do envio automático
+- [ ] Auditoria de cada decisão/resposta
+- [ ] Conectar provedor de IA sem custo ou com custo previamente aprovado
