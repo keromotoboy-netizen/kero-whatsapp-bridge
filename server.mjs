@@ -315,6 +315,14 @@ app.post('/crm/read', secure, (req, res) => {
   res.json({ ok: true });
 });
 
+app.post('/crm/resync', secure, async (_req, res) => {
+  if (!sock || status !== 'open') return res.status(409).json({ error: 'whatsapp_not_connected' });
+  const collections = ['critical_unblock_low','regular_high','regular_low','critical_block','regular'];
+  await sock.resyncAppState(collections, true);
+  const groups = await CRM.syncGroups(sock).catch(() => 0);
+  res.json({ ok: true, groups });
+});
+
 app.post('/connect/phone', secure, async (req, res) => {
   const phone = normalizePhone(req.body?.phone);
   if (!phone) {

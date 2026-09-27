@@ -199,8 +199,9 @@ export function createCrmStore(dataDir) {
   };
 
   const mergeHistory = payload => {
-    for (const c of payload?.chats || []) upsertChat(c);
+    for (const map of payload?.lidPnMappings || []) upsertLidMapping(map);
     for (const c of payload?.contacts || []) upsertContact(c);
+    for (const c of payload?.chats || []) upsertChat(c);
     for (const m of payload?.messages || []) upsertMessage(m);
   };
 
