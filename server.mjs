@@ -7,6 +7,7 @@ import makeWASocket, {
 import QRCode from 'qrcode';
 import pino from 'pino';
 import fs from 'node:fs';
+import { createCrmStore } from './crm-store.mjs';
 
 const app = express();
 app.use(express.json({ limit: '64kb' }));
@@ -20,6 +21,7 @@ if (!API_SECRET) {
   process.exit(1);
 }
 fs.mkdirSync(DATA_DIR, { recursive: true });
+const CRM = createCrmStore(DATA_DIR);
 
 let sock = null;
 let status = 'idle';
@@ -110,9 +112,11 @@ async function startSession(mode, phone = null) {
       logger: pino({ level: 'warn' }),
       browser: ['Kero CRM', 'Chrome', '1.0.0'],
       markOnlineOnConnect: false,
-      syncFullHistory: false
+      syncFullHistory: true,
+      shouldSyncHistoryMessage: () => true
     });
 
+    CRM.attach(sock);
     sock.ev.on('creds.update', saveCreds);
     sock.ev.on('connection.update', async update => {
       if (update.connection) status = update.connection;
@@ -145,6 +149,7 @@ async function startSession(mode, phone = null) {
         pairingCode = null;
         lastError = null;
         console.log('[wa] connected successfully');
+        CRM.syncGroups(sock).then(n => console.log('[crm] groups synced=' + n)).catch(e => console.error('[crm] group sync failed', e?.message || e));
       }
 
       if (update.connection === 'close') {
@@ -236,6 +241,38 @@ app.post('/connect/qr', secure, async (_req, res) => {
   }
 });
 
+
+app.get('/crm/snapshot', secure, (req, res) => {
+  const archived = String(req.query.archived || '') === '1';
+  const search = String(req.query.search || '');
+  const labelId = String(req.query.labelId || '');
+  res.json(CRM.snapshot({ archived, search, labelId }));
+});
+
+app.get('/crm/messages', secure, (req, res) => {
+  const jid = String(req.query.jid || '');
+  if (!jid) return res.status(400).json({ error: 'missing_jid' });
+  const limit = Math.min(500, Math.max(1, Number(req.query.limit || 120)));
+  res.json({ jid, messages: CRM.getMessages(jid, limit) });
+});
+
+app.post('/crm/send', secure, async (req, res) => {
+  const jid = String(req.body?.jid || '');
+  const text = String(req.body?.text || '').trim();
+  if (!jid || !text) return res.status(400).json({ error: 'jid_and_text_required' });
+  if (!sock || status !== 'open') return res.status(409).json({ error: 'whatsapp_not_connected' });
+  const sent = await sock.sendMessage(jid, { text });
+  if (sent) CRM.upsertMessage(sent);
+  res.json({ ok: true, messageId: sent?.key?.id || null });
+});
+
+app.post('/crm/read', secure, (req, res) => {
+  const jid = String(req.body?.jid || '');
+  if (!jid) return res.status(400).json({ error: 'missing_jid' });
+  CRM.markReadLocal(jid);
+  res.json({ ok: true });
+});
+
 app.post('/connect/phone', secure, async (req, res) => {
   const phone = normalizePhone(req.body?.phone);
   if (!phone) {
@@ -255,4 +292,9 @@ app.post('/connect/phone', secure, async (req, res) => {
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Kero WhatsApp Bridge listening on ${PORT}`);
+  setTimeout(() => {
+    startSession('resume').catch(error => {
+      console.error('[wa] automatic resume failed', error?.message || error);
+    });
+  }, 1000);
 });
