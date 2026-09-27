@@ -29,6 +29,7 @@ let pairingCode = null;
 let lastError = null;
 let phoneInUse = null;
 let startLock = null;
+let restartPending = false;
 
 function secure(req, res, next) {
   const provided = req.get('x-api-key') || '';
@@ -130,10 +131,12 @@ async function startSession(mode, phone = null) {
 
       if (update.connection === 'open') {
         status = 'open';
+        restartPending = false;
         latestQr = null;
         latestQrDataUrl = null;
         pairingCode = null;
         lastError = null;
+        console.log('[wa] connected successfully');
       }
 
       if (update.connection === 'close') {
@@ -143,6 +146,36 @@ async function startSession(mode, phone = null) {
           error?.data?.statusCode ||
           null;
 
+        console.log(`[wa] connection closed code=${code ?? 'unknown'} mode=${mode}`);
+
+        if (code === DisconnectReason.restartRequired || code === 515) {
+          status = 'restarting';
+          lastError = null;
+
+          if (!restartPending) {
+            restartPending = true;
+            const resumePhone = phoneInUse;
+            console.log('[wa] restartRequired (515): reconnecting immediately with saved credentials');
+            setTimeout(async () => {
+              try {
+                while (startLock) await sleep(25);
+                restartPending = false;
+                await startSession('resume', resumePhone);
+              } catch (restartError) {
+                lastError = {
+                  stage: 'restartRequired',
+                  code: 515,
+                  message: restartError?.message || String(restartError)
+                };
+                status = 'close';
+                restartPending = false;
+              }
+            }, 0);
+          }
+          return;
+        }
+
+        restartPending = false;
         lastError = {
           stage: 'connection',
           code,
