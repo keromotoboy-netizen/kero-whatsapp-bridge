@@ -44,6 +44,7 @@ function publicState() {
     status,
     connected: status === 'open',
     hasQr: !!latestQrDataUrl,
+    qr: latestQrDataUrl || null,
     pairingCode: pairingCode || null,
     phone: phoneInUse || null,
     lastError
@@ -83,7 +84,14 @@ async function waitFor(predicate, timeoutMs = 15000) {
 async function startSession(mode, phone = null) {
   if (startLock) return startLock;
   startLock = (async () => {
+    const freshPairing = mode === 'qr' || mode === 'phone';
+    if (freshPairing && status === 'open') return publicState();
     await stopSocket();
+    if (freshPairing) {
+      fs.rmSync(DATA_DIR, { recursive: true, force: true });
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+      console.log('[wa] cleared stale auth before fresh pairing');
+    }
     status = 'starting';
     latestQr = null;
     latestQrDataUrl = null;
