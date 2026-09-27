@@ -10,7 +10,7 @@ import fs from 'node:fs';
 import { createCrmStore } from './crm-store.mjs';
 
 const app = express();
-app.use(express.json({ limit: '64kb' }));
+app.use(express.json({ limit: '24mb' }));
 
 const PORT = Number(process.env.PORT || 3000);
 const API_SECRET = process.env.API_SECRET || '';
@@ -256,12 +256,54 @@ app.get('/crm/messages', secure, (req, res) => {
   res.json({ jid, messages: CRM.getMessages(jid, limit) });
 });
 
+app.get('/crm/avatar', secure, async (req, res) => {
+  const jid = String(req.query.jid || '');
+  if (!jid) return res.status(400).json({ error: 'missing_jid' });
+  if (!sock || status !== 'open') return res.json({ url: null });
+  try {
+    const url = await sock.profilePictureUrl(jid, 'preview', 5000);
+    if (url) CRM.upsertContact({ id: jid, imgUrl: url });
+    res.json({ url: url || null });
+  } catch {
+    res.json({ url: null });
+  }
+});
+
 app.post('/crm/send', secure, async (req, res) => {
   const jid = String(req.body?.jid || '');
   const text = String(req.body?.text || '').trim();
   if (!jid || !text) return res.status(400).json({ error: 'jid_and_text_required' });
   if (!sock || status !== 'open') return res.status(409).json({ error: 'whatsapp_not_connected' });
   const sent = await sock.sendMessage(jid, { text });
+  if (sent) CRM.upsertMessage(sent);
+  res.json({ ok: true, messageId: sent?.key?.id || null });
+});
+
+app.post('/crm/send-media', secure, async (req, res) => {
+  const jid = String(req.body?.jid || '');
+  const kind = String(req.body?.kind || '');
+  const dataBase64 = String(req.body?.dataBase64 || '');
+  const mimetype = String(req.body?.mimetype || 'application/octet-stream');
+  const fileName = String(req.body?.fileName || 'arquivo').slice(0, 180);
+  const caption = String(req.body?.caption || '').slice(0, 2000);
+  const ptt = !!req.body?.ptt;
+
+  if (!jid || !['image','document','audio'].includes(kind) || !dataBase64) {
+    return res.status(400).json({ error: 'invalid_media_payload' });
+  }
+  if (!sock || status !== 'open') return res.status(409).json({ error: 'whatsapp_not_connected' });
+
+  const buffer = Buffer.from(dataBase64, 'base64');
+  if (!buffer.length || buffer.length > 16 * 1024 * 1024) {
+    return res.status(413).json({ error: 'media_too_large', maxBytes: 16777216 });
+  }
+
+  let content;
+  if (kind === 'image') content = { image: buffer, mimetype, caption };
+  if (kind === 'document') content = { document: buffer, mimetype, fileName, caption };
+  if (kind === 'audio') content = { audio: buffer, mimetype, ptt };
+
+  const sent = await sock.sendMessage(jid, content);
   if (sent) CRM.upsertMessage(sent);
   res.json({ ok: true, messageId: sent?.key?.id || null });
 });

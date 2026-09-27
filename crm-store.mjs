@@ -54,7 +54,7 @@ export function createCrmStore(dataDir) {
   let state = {
     version: 1, rev: 0, updatedAt: Date.now(),
     chats: {}, messages: {}, contacts: {}, groups: {},
-    labels: {}, chatLabels: {}
+    labels: {}, chatLabels: {}, lidMap: {}
   };
   let saveTimer = null;  try {
     if (fs.existsSync(file)) {
@@ -82,10 +82,15 @@ export function createCrmStore(dataDir) {
     saveTimer = setTimeout(saveNow, 250);
   };
 
+  const contactFor = jid => {
+    const mapped = state.lidMap[jid];
+    return state.contacts[jid] || (mapped ? state.contacts[mapped] : null) || {};
+  };
+
   const chatName = jid => {
     const group = state.groups[jid];
     if (group?.subject) return group.subject;
-    const c = state.contacts[jid] || {};
+    const c = contactFor(jid);
     const chat = state.chats[jid] || {};
     return c.name || c.notify || c.verifiedName || chat.name || chat.pushName || safeNameFromJid(jid);
   };
@@ -109,7 +114,27 @@ export function createCrmStore(dataDir) {
   const upsertContact = input => {
     const jid = input?.id;
     if (!jid) return;
-    state.contacts[jid] = { ...(state.contacts[jid] || {}), ...input };
+    const merged = { ...(state.contacts[jid] || {}), ...input };
+    state.contacts[jid] = merged;
+    if (input.lid) {
+      state.contacts[input.lid] = { ...(state.contacts[input.lid] || {}), ...merged, id: input.lid };
+      state.lidMap[input.lid] = input.phoneNumber || jid;
+    }
+    if (input.phoneNumber) {
+      state.contacts[input.phoneNumber] = { ...(state.contacts[input.phoneNumber] || {}), ...merged, id: input.phoneNumber };
+      state.lidMap[input.phoneNumber] = input.lid || jid;
+    }
+    touch();
+  };
+
+  const upsertLidMapping = mapping => {
+    if (!mapping?.pn || !mapping?.lid) return;
+    state.lidMap[mapping.lid] = mapping.pn;
+    state.lidMap[mapping.pn] = mapping.lid;
+    const pn = state.contacts[mapping.pn];
+    const lid = state.contacts[mapping.lid];
+    if (pn && !lid) state.contacts[mapping.lid] = { ...pn, id: mapping.lid, lid: mapping.lid, phoneNumber: mapping.pn };
+    if (lid && !pn) state.contacts[mapping.pn] = { ...lid, id: mapping.pn, lid: mapping.lid, phoneNumber: mapping.pn };
     touch();
   };
 
@@ -134,7 +159,9 @@ export function createCrmStore(dataDir) {
     const id = raw?.key?.id;
     if (!id) return;
     const chat = ensureChat(jid);
-    const ts = numberValue(raw.messageTimestamp) || Math.floor(Date.now() / 1000);    const item = {
+    const ts = numberValue(raw.messageTimestamp) || Math.floor(Date.now() / 1000);    const unwrapped = unwrapMessage(raw.message);
+    const loc = unwrapped?.liveLocationMessage || unwrapped?.locationMessage || null;
+    const item = {
       id,
       jid,
       fromMe: !!raw.key.fromMe,
@@ -142,7 +169,19 @@ export function createCrmStore(dataDir) {
       pushName: raw.pushName || null,
       timestamp: ts,
       text: messageText(raw.message),
-      type: messageType(raw.message)
+      type: messageType(raw.message),
+      deleted: false,
+      location: loc && loc.degreesLatitude != null && loc.degreesLongitude != null ? {
+        latitude: Number(loc.degreesLatitude),
+        longitude: Number(loc.degreesLongitude),
+        accuracy: loc.accuracyInMeters == null ? null : Number(loc.accuracyInMeters),
+        speed: loc.speedInMps == null ? null : Number(loc.speedInMps),
+        live: !!(unwrapped?.liveLocationMessage || loc.isLive),
+        sequenceNumber: numberValue(loc.sequenceNumber),
+        name: loc.name || null,
+        address: loc.address || null,
+        caption: loc.caption || loc.comment || null
+      } : null
     };
 
     const arr = state.messages[jid] ||= [];
@@ -163,6 +202,22 @@ export function createCrmStore(dataDir) {
     for (const c of payload?.chats || []) upsertChat(c);
     for (const c of payload?.contacts || []) upsertContact(c);
     for (const m of payload?.messages || []) upsertMessage(m);
+  };
+
+  const markDeleted = payload => {
+    if (!payload?.keys) return;
+    for (const key of payload.keys) {
+      const jid = key?.remoteJid;
+      const id = key?.id;
+      if (!jid || !id) continue;
+      const arr = state.messages[jid] || [];
+      const item = arr.find(x => x.id === id);
+      if (item) {
+        item.deleted = true;
+        item.deletedAt = Date.now();
+      }
+    }
+    touch();
   };
 
   const editLabel = label => {
@@ -195,7 +250,11 @@ export function createCrmStore(dataDir) {
         lastMessage: c.lastMessage || '',
         lastMessageTimestamp: Number(c.lastMessageTimestamp || c.conversationTimestamp || 0),
         isGroup: c.id.endsWith('@g.us'),
-        labels: state.chatLabels[c.id] || []
+        labels: state.chatLabels[c.id] || [],
+        avatar: (() => {
+          const contact = contactFor(c.id);
+          return contact?.imgUrl && contact.imgUrl !== 'changed' ? contact.imgUrl : null;
+        })()
       }))
       .filter(c => !q || (c.name + ' ' + c.id + ' ' + c.lastMessage).toLowerCase().includes(q))
       .sort((a,b) => b.lastMessageTimestamp - a.lastMessageTimestamp);
@@ -227,7 +286,9 @@ export function createCrmStore(dataDir) {
     sock.ev.on('chats.update', chats => chats.forEach(upsertChat));
     sock.ev.on('contacts.upsert', contacts => contacts.forEach(upsertContact));
     sock.ev.on('contacts.update', contacts => contacts.forEach(upsertContact));
+    sock.ev.on('lid-mapping.update', upsertLidMapping);
     sock.ev.on('messages.upsert', ({ messages }) => messages.forEach(upsertMessage));
+    sock.ev.on('messages.delete', markDeleted);
     sock.ev.on('groups.upsert', groups => groups.forEach(upsertGroup));
     sock.ev.on('groups.update', groups => groups.forEach(upsertGroup));
     sock.ev.on('labels.edit', editLabel);
@@ -247,6 +308,7 @@ export function createCrmStore(dataDir) {
     upsertMessage,
     upsertChat,
     upsertGroup,
+    upsertContact,
     snapshot,
     getMessages,
     markReadLocal,
