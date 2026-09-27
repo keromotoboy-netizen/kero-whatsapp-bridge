@@ -315,6 +315,18 @@ app.post('/crm/read', secure, (req, res) => {
   res.json({ ok: true });
 });
 
+app.post('/crm/presence', secure, async (req, res) => {
+  const jid = String(req.body?.jid || '');
+  if (!jid) return res.status(400).json({ error: 'missing_jid' });
+  if (!sock || status !== 'open') return res.status(409).json({ error: 'whatsapp_not_connected' });
+  try {
+    await sock.presenceSubscribe(jid);
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(502).json({ error: 'presence_subscribe_failed', message: error?.message || String(error) });
+  }
+});
+
 app.post('/crm/resync', secure, async (_req, res) => {
   if (!sock || status !== 'open') return res.status(409).json({ error: 'whatsapp_not_connected' });
   const collections = ['critical_unblock_low','regular_high','regular_low','critical_block','regular'];

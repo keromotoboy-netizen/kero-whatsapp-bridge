@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { WAMessageStubType } from 'baileys';
 
 const MAX_MESSAGES_PER_CHAT = 500;
 
@@ -54,7 +55,7 @@ export function createCrmStore(dataDir) {
   let state = {
     version: 1, rev: 0, updatedAt: Date.now(),
     chats: {}, messages: {}, contacts: {}, groups: {},
-    labels: {}, chatLabels: {}, lidMap: {}
+    labels: {}, chatLabels: {}, lidMap: {}, presences: {}
   };
   let saveTimer = null;  try {
     if (fs.existsSync(file)) {
@@ -221,6 +222,46 @@ export function createCrmStore(dataDir) {
     touch();
   };
 
+  const handleMessageUpdates = updates => {
+    let changed = false;
+    for (const entry of updates || []) {
+      const key = entry?.key;
+      const update = entry?.update || {};
+      if (update.message === null && Number(update.messageStubType) === Number(WAMessageStubType.REVOKE)) {
+        const jid = key?.remoteJid;
+        const id = key?.id;
+        if (!jid || !id) continue;
+        const arr = state.messages[jid] || [];
+        const item = arr.find(x => x.id === id);
+        if (item) {
+          item.deleted = true;
+          item.deletedAt = Date.now();
+          item.deletedForEveryone = true;
+          changed = true;
+        }
+      }
+    }
+    if (changed) touch();
+  };
+
+  const upsertPresence = payload => {
+    if (!payload) return;
+    const now = Date.now();
+    let chosen = null;
+    for (const [jid, data] of Object.entries(payload.presences || {})) {
+      const value = {
+        lastKnownPresence: data?.lastKnownPresence || 'unavailable',
+        lastSeen: data?.lastSeen == null ? null : Number(data.lastSeen),
+        groupOnlineCount: data?.groupOnlineCount == null ? null : Number(data.groupOnlineCount),
+        updatedAt: now
+      };
+      state.presences[jid] = value;
+      chosen = value;
+    }
+    if (payload.id && chosen) state.presences[payload.id] = chosen;
+    touch();
+  };
+
   const editLabel = label => {
     if (!label?.id) return;
     if (label.deleted) delete state.labels[label.id];
@@ -255,7 +296,8 @@ export function createCrmStore(dataDir) {
         avatar: (() => {
           const contact = contactFor(c.id);
           return contact?.imgUrl && contact.imgUrl !== 'changed' ? contact.imgUrl : null;
-        })()
+        })(),
+        presence: state.presences[c.id] || null
       }))
       .filter(c => !q || (c.name + ' ' + c.id + ' ' + c.lastMessage).toLowerCase().includes(q))
       .sort((a,b) => b.lastMessageTimestamp - a.lastMessageTimestamp);
@@ -289,7 +331,9 @@ export function createCrmStore(dataDir) {
     sock.ev.on('contacts.update', contacts => contacts.forEach(upsertContact));
     sock.ev.on('lid-mapping.update', upsertLidMapping);
     sock.ev.on('messages.upsert', ({ messages }) => messages.forEach(upsertMessage));
+    sock.ev.on('messages.update', handleMessageUpdates);
     sock.ev.on('messages.delete', markDeleted);
+    sock.ev.on('presence.update', upsertPresence);
     sock.ev.on('groups.upsert', groups => groups.forEach(upsertGroup));
     sock.ev.on('groups.update', groups => groups.forEach(upsertGroup));
     sock.ev.on('labels.edit', editLabel);
@@ -310,6 +354,7 @@ export function createCrmStore(dataDir) {
     upsertChat,
     upsertGroup,
     upsertContact,
+    upsertPresence,
     snapshot,
     getMessages,
     markReadLocal,
