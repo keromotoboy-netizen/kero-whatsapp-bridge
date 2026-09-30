@@ -114,8 +114,47 @@ export function invoiceRequestPlan({ client = {}, invoice = {} } = {}) {
     ready: true,
     missing: [],
     nextAction: 'delegate_to_finance_invoice_agent',
-    customerMessage: 'Maravilha, já passei para o financeiro emitir. Assim que estiver pronta eu te envio por aqui.'
+    customerMessage: 'Maravilha, jÃ¡ passei para o financeiro emitir. Assim que estiver pronta eu te envio por aqui.'
   };
 }
 
+
+export const CURRENT_STAFF = Object.freeze({
+  victor: { active: true, pointsEligible: false },
+  ailla: { active: true, pointsEligible: false },
+  victoria: { active: true, pointsEligible: true }
+});
+
+export function billingProfileFromLabels(labels = []) {
+  const normalized = labels.map(x => String(x || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase());
+  return {
+    invoicedMonthly: normalized.some(x => x.includes('faturad')),
+    isCourier: normalized.some(x => x.includes('motoboy') || x.includes('motorista')),
+    isClient: normalized.some(x => x.includes('cliente') || x.includes('faturad'))
+  };
+}
+
+export function classifyFiscalDocument({ direction, senderType, explicitIntent = '', mimeType = '', fileName = '' } = {}) {
+  const intent = String(explicitIntent || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+  const file = String(fileName || '').toLowerCase();
+  const looksFiscal = /nota|nf|nfse|nfs-e|danf|danfe/.test(intent + ' ' + file) || /pdf/.test(String(mimeType || '').toLowerCase());
+
+  if (direction === 'client_to_kero' && senderType === CONTACT_TYPES.CLIENT && looksFiscal) {
+    if (/emit|emissao|me manda|me envia|preciso.*nota|nota fiscal.*servico/.test(intent)) {
+      return { action: 'request_kero_invoice', specialistAgent: 'finance_invoice' };
+    }
+    return {
+      action: 'pickup_support_document',
+      attachToService: true,
+      forwardToCourierWhenAssigned: true,
+      specialistAgent: null
+    };
+  }
+
+  if (direction === 'kero_to_client' && looksFiscal) {
+    return { action: 'kero_invoice_delivery', attachToService: true };
+  }
+
+  return { action: 'generic_document_review' };
+}
 export { SERVICE_MODES, CONTACT_TYPES, GROUP_TYPES };

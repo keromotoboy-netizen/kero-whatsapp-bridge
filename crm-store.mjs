@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { WAMessageStubType } from 'baileys';
+import { inferGroupPolicy } from './group-policy.mjs';
 
 const MAX_MESSAGES_PER_CHAT = 500;
 
@@ -142,12 +143,16 @@ export function createCrmStore(dataDir) {
   const upsertGroup = input => {
     const jid = input?.id;
     if (!jid) return;
+    const subject = input.subject || state.groups[jid]?.subject || jid;
+    const desc = input.desc || state.groups[jid]?.desc || '';
+    const labels = state.chatLabels[jid] || [];
     const group = {
       id: jid,
-      subject: input.subject || state.groups[jid]?.subject || jid,
-      desc: input.desc || state.groups[jid]?.desc || '',
+      subject,
+      desc,
       size: input.size ?? input.participants?.length ?? state.groups[jid]?.size ?? 0,
-      creation: input.creation || state.groups[jid]?.creation || 0
+      creation: input.creation || state.groups[jid]?.creation || 0,
+      inferredPolicy: inferGroupPolicy({ subject, name: subject, description: desc, labels })
     };
     state.groups[jid] = { ...(state.groups[jid] || {}), ...group };
     ensureChat(jid);
