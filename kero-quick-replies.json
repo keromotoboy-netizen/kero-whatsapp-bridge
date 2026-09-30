@@ -1,0 +1,24 @@
+{
+  "version": "2026-09-30",
+  "notes": "Preço e mensagem final de orçamento devem sempre ser obtidos de /calculadora. Procedimentos de rota devem respeitar /rotas.",
+  "templates": {
+    "ask_addresses_item": "✅ Pfvr Quais os endereços com Rua, bairro e número de *Retirada e entrega?*\n\n🔰 *O que será para Retirar* com Peso, dimensões ?",
+    "courier_general_procedure": "📍*IMPORTANTE*\n🔰*Procedimento 1:*\n✅ Foto do local e foto da retirada.\n\n🔰 *Procedimento 2:*\n✅ Foto do local e dados do Recebedor📷\n\n😄🙏 Tenha uma Boa rota que Deus abençoe grandemente ✨",
+    "courier_not_selected": "🥹 Dessa vez subiu para o portador mais próximo e/ou disponível 🙏\n✅️*Muito obrigado pela disponibilidade!*\n\nQue Deus abençoe grandemente sua vida 🙌\n“Tudo tem o seu tempo determinado por Deus.” — Eclesiastes 3:1",
+    "supergrupo_selected": "✅Opaa te passei o trampo pelo super grupo\n\n📍Vou te passar a o.s com todos os detalhes pra retirar e entregar 🙏",
+    "missed_call": "📍*IMPORTANTE* Perdao não consigo atender no momento estou em ligação com mais um cliente .\n\n✅Me confirme essas informações: *endereços* Pfvr",
+    "quote_followup": "Vamos confirmar a corrida?",
+    "invoice_delegated": "Maravilha, já passei para o financeiro emitir. Assim que estiver pronta eu te envio por aqui.",
+    "rating_request": "Aproveitando o contato voce consegue me ajudar com uma avaliação no link do Google? 😄🙏",
+    "food_transport": "📍 Sobre Transporte de Alimentos\n\n✅ Realizamos o transporte de alimentos com extremo cuidado e com a mesma qualidade de sempre 😄🙏\n\n⚠️ porém a responsabilidade de estar adequadamente embalado é totalmente da pessoa/estabelecimento q estiver entregando ao motoboy.\n\nCaso derrame, derreta, deforme ou amasse por esses motivos, não nos responsabilizamos 🙏🏻",
+    "weight_dimension_explanation": "📍Sobre o adicional de peso e dimensões\n\n🔰Acima de 20 kg e/ou dimensões 50x50x50: Haverá um adicional de 20% para a entrega\n\n🔰Motivos\n📍Segurança do Motociclista\n📍Desgaste da Moto\n📍Eficiência de combustível\n📍Dificuldade em atender o tempo de entrega\n📍Custos de Mão de Obra\n📍Desconformidade com regulamentações da lei de trânsito para Motociclistas.\n📍Risco de infração ao portador.\n\n(Exceto, Caso o cliente tenha solicitado Carro, Van, Utilitário ou Caminhão.)",
+    "billed_client_offer": "🖋️ *FATURADOS*\nEnviamos uma proposta comercial os dados da empresa.\n\n📍*Como funciona?*\n\n📆 *serviços realizados do Dia 01 ao 30/31*\n\n💱 *Fechamento*: dia 30/31 Enviamos: emissão da NF + resumo de todos os servicos por email + Boleto:\n*Para Pagamento:* no 5° dia útil\n\n✅ Em caso de atraso de pagamento sao acrescidos 20% sobre o valor e/ou *Dívida protestada* junto ao cartório de protestos.",
+    "daily_billed_summary": "📆 *Data {{date}}*\n🔰*Quem pediu:* {{requester}}\n✅ *Valor do serviço:* {{service_value}}\n✅ *Pedágio/tempo de espera:* {{extras}}\n📍*Endereços*\n{{addresses}}",
+    "waiting_time": "✅ *Tempo de espera* (15 min livre após 0,80$ o min)\n📍 *Chegada* {{arrival}}\n📍 *Saída* {{departure}}\n✨ *Tempo no local* {{total_minutes}} min\n✨ *Tempo calculado* {{billable_minutes}} min\n🔰 *Total:* {{amount}} Reais",
+    "shift_report": "📍 *Relatório*\n✅*Subir Serviço?:*\n{{services_to_post}}\n\n✅ *Em Rota?*\n{{services_in_route}}\n\n➖➖➖➖➖➖➖➖➖\n✅ *Algum cliente pediu orçamento e falta confirmar ?*\n{{quotes_waiting}}\n\n✅ *Serviço agendado?:*\n{{scheduled}}\n\n✅ *Observação importante? :*\n{{notes}}",
+    "larcon_procedure": "📍*IMPORTANTE*\n⚠️*Especifico dessa Rota: cliente LARCON*⚠️\n\n🔰*Procedimento:*\n📷 *Foto* do malote que esta entregando em frente o *n° do endereço*.\n\n📷 *Foto* do malote Retirado em frente o *n° do endereço*\n*MOSTRANDO O LACRE OU CADEADO VISIVEL*\n\ne ai só partir pro próximo 🚀",
+    "condo_admin_procedure": "📍No 1°local (meu cliente)\nFala q vc *Trabalha pra Kero Motoboy*\n\n📍No local de troca/entrega de malote\nFala q foi trocar os *malotes da:*\n\n📍*IMPORTANTE*\n⚠️*Foto do malote em frente o endereço* o q estiver entregando e outro do malote que esta retirando\n(Nao precisa pegar nome)",
+    "fernanda_procedure": "📍*IMPORTANTE*\n⚠️*Procedimento especificamente da cliente Fernanda dframe e decato*⚠️\n📌*Procedimento 1:* Tirar foto da NF e descartar.\n(Nao entregar no local de entrega)\n📌*procedimento 2:*\nVerificar se tem adesivos com nome DECATO E DFRAME E REMOVÊ-LOS.\n\n✨️_Boa rota Deus abençoe_\n“O Senhor guardará a tua saída e a tua entrada.” — Salmos 121:8",
+    "moove_procedure": "📍IMPORTANTE\n⚠️*Procedimento do cliente Moove*⚠️\n\n🔰Procedimento:\n✅ Tirar foto de tudo separadamente,\nPrincipalmente se assinarem algo 🙏\n(Caso envelope estiver lacrado nao abrir)"
+  }
+}

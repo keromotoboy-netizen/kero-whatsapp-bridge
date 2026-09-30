@@ -1,0 +1,336 @@
+{
+  "version": "2026-09-30",
+  "precedence": [
+    "crm_state",
+    "calculator",
+    "routes",
+    "customer_procedure",
+    "group_description",
+    "rulebook",
+    "quick_reply_template"
+  ],
+  "whatsapp": {
+    "currentSession": "alternate_test_number",
+    "officialNumberPending": true
+  },
+  "staff": {
+    "victor": {
+      "active": true,
+      "pointsEligible": false
+    },
+    "ailla": {
+      "active": true,
+      "pointsEligible": false
+    },
+    "victoria": {
+      "active": true,
+      "pointsEligible": true
+    },
+    "ana": {
+      "active": false,
+      "pointsEligible": false,
+      "historicalOnly": true
+    }
+  },
+  "businessHours": {
+    "mon_fri": {
+      "open": "08:00",
+      "close": "20:00"
+    },
+    "holidays": {
+      "open": "08:00",
+      "close": "20:00"
+    },
+    "saturday": {
+      "open": "08:00",
+      "close": "16:00"
+    },
+    "sunday": {
+      "appointments": true,
+      "courierAvailabilityRequired": true
+    },
+    "afterHours": {
+      "aiMayReply": true,
+      "mayPromiseCourier": false
+    }
+  },
+  "payment": {
+    "clientProofMeansPaid": true,
+    "invoicedClientNeedsPerServicePayment": false,
+    "keroProofToCourierMeansCourierPaid": true,
+    "allocationPriority": {
+      "urgent": "immediate",
+      "non_urgent": "normal_sla",
+      "split": "split_queue"
+    }
+  },
+  "waiting": {
+    "customer": {
+      "freeMinutes": 15,
+      "perMinute": 0.8,
+      "start": "arrival_photo",
+      "pickupEnd": "pickup_item_photo",
+      "deliveryEnd": "delivered_plus_receiver_name"
+    },
+    "courier": {
+      "freeMinutes": 20,
+      "perMinute": 0.4,
+      "start": "arrival_photo"
+    }
+  },
+  "motorcycle": {
+    "dimensionSurchargePct": 20,
+    "surchargeIf": {
+      "weightKgAbove": 20,
+      "boxDimensionCmAbove": 50
+    },
+    "slimLightMaxLengthCm": 130
+  },
+  "vehicles": {
+    "car": {
+      "lengthM": 1.2,
+      "widthM": 1,
+      "heightM": 0.65,
+      "maxKg": 250
+    },
+    "fiorino": {
+      "lengthM": 1.8,
+      "widthM": 1.1,
+      "heightM": 1.3,
+      "maxKg": 600,
+      "cubicM": 3.3
+    },
+    "strada": {
+      "lengthM": 2.5,
+      "widthM": 1.1,
+      "heightM": 1.3,
+      "maxKg": 600,
+      "cubicM": 3.3
+    },
+    "van": {
+      "lengthM": 2.8,
+      "widthM": 1.8,
+      "heightM": 1.9,
+      "maxKg": 1500,
+      "cubicM": 10
+    },
+    "iveco_master": {
+      "lengthM": 3.8,
+      "widthM": 1.8,
+      "heightM": 1.9,
+      "maxKg": 2000,
+      "cubicM": 16
+    },
+    "flatbed_truck": {
+      "lengthM": 5.5,
+      "widthM": 2.3,
+      "maxKg": 5000
+    }
+  },
+  "ownCourierGroup": {
+    "rulesUpdated": "2026-02-22",
+    "cashSameDay": [
+      {
+        "minKm": 0,
+        "maxKm": 10.9,
+        "amount": 20
+      },
+      {
+        "minKm": 11,
+        "maxKm": 16.9,
+        "amount": 25
+      },
+      {
+        "minKm": 17,
+        "perKm": 1.5
+      }
+    ],
+    "invoicedAfter24h": [
+      {
+        "minKm": 0,
+        "maxKm": 10.9,
+        "amount": 25
+      },
+      {
+        "minKm": 11,
+        "maxKm": 16.9,
+        "amount": 32
+      },
+      {
+        "minKm": 17,
+        "perKm": 2
+      }
+    ],
+    "additionalStop": 2,
+    "lateFee": {
+      "startsAfterHours": 48,
+      "perDay": 5
+    },
+    "courierWaiting": {
+      "freeMinutes": 20,
+      "perMinute": 0.4
+    },
+    "displacementCancellation": 15,
+    "liveLocationDeadlineMinutes": 5,
+    "split": {
+      "minKm": 70,
+      "fromPerKm": 1
+    }
+  },
+  "allocation": {
+    "criteria": [
+      "immediate_availability",
+      "distance_to_pickup"
+    ],
+    "candidateQuestion": "Verificando o mais próximo. Daí pro primeiro endereço demoraria quanto tempo?",
+    "waitForCandidateMinutes": {
+      "min": 5,
+      "max": 10
+    },
+    "oneCourierOnly": true,
+    "deleteGroupPostsAfterAllocation": true
+  },
+  "billing": {
+    "monthlyPeriod": "01-last_day",
+    "closeAtMonthEnd": true,
+    "due": "5th_business_day",
+    "mustReconcileBeforeInvoice": true,
+    "dailySummaryFields": [
+      "date",
+      "requester",
+      "service_value",
+      "toll_waiting",
+      "addresses"
+    ]
+  },
+  "invoiceDataRequired": {
+    "company": [
+      "legalName",
+      "fullAddressZip",
+      "phone",
+      "cnpj",
+      "email"
+    ],
+    "responsible": [
+      "name",
+      "rgCpf"
+    ]
+  },
+  "specificCustomers": {
+    "larcon": {
+      "procedures": [
+        "photo_delivered_bag_at_address_number",
+        "photo_collected_bag_at_address_number",
+        "seal_or_lock_visible"
+      ]
+    },
+    "condominium_admins": {
+      "clients": [
+        "larcon",
+        "harmonia",
+        "lm_melo"
+      ],
+      "procedures": [
+        "say_work_for_kero_at_first_location",
+        "identify_bag_exchange_company",
+        "photo_delivered_bag_at_address",
+        "photo_collected_bag_at_address",
+        "receiver_name_not_required",
+        "follow_routes_final_message"
+      ]
+    },
+    "fernanda_dframe_decato": {
+      "askWhichProceduresApply": true,
+      "procedures": [
+        "photo_invoice_then_discard_do_not_deliver",
+        "remove_decato_dframe_labels"
+      ]
+    },
+    "moove": {
+      "procedures": [
+        "photo_everything_separately",
+        "photo_signed_items",
+        "do_not_open_sealed_envelope"
+      ]
+    }
+  },
+  "postalRequired": {
+    "sender": [
+      "name",
+      "cpf",
+      "zip",
+      "city"
+    ],
+    "recipient": [
+      "name",
+      "cpf",
+      "address",
+      "zip",
+      "city"
+    ]
+  },
+  "splitRegions": {
+    "litoral": [
+      "cubatao",
+      "sao_vicente",
+      "santos",
+      "praia_grande",
+      "guaruja"
+    ],
+    "east": {
+      "upTo": "sao_jose_dos_campos",
+      "exclude": [
+        "mogi_das_cruzes"
+      ]
+    },
+    "north": {
+      "upTo": "piracicaba"
+    },
+    "west": {
+      "upTo": [
+        "sorocaba",
+        "votorantim",
+        "salto",
+        "itu"
+      ]
+    },
+    "others": {
+      "weekdayOnly": true,
+      "minLeadHours": 24,
+      "mayRaisePrice": true
+    }
+  },
+  "proofFlow": {
+    "pickup": [
+      "arrival_location_photo",
+      "pickup_item_photo"
+    ],
+    "delivery": [
+      "arrival_location_photo",
+      "receiver_data"
+    ]
+  },
+  "shifts": {
+    "victoriaReportFields": [
+      "services_to_post",
+      "services_in_route",
+      "quotes_awaiting_confirmation",
+      "scheduled_services",
+      "important_observations"
+    ]
+  },
+  "points": {
+    "eligibleStaff": [
+      "victoria"
+    ],
+    "saturdayHolidayRulePendingConfirmation": true
+  },
+  "integrations": {
+    "calculator": "authoritative_quote",
+    "routes": "authoritative_route",
+    "supergrupo": "planned",
+    "sheets": "Faturamento Kero Motoboy 2026",
+    "nfse": "planned_agent_assisted",
+    "ads": "planned_attribution"
+  }
+}

@@ -8,6 +8,8 @@ import QRCode from 'qrcode';
 import pino from 'pino';
 import fs from 'node:fs';
 import { createCrmStore } from './crm-store.mjs';
+import { createAiAgent } from './ai-agent.mjs';
+import { createAgentTaskStore } from './agent-task-store.mjs';
 
 const app = express();
 app.use(express.json({ limit: '24mb' }));
@@ -32,6 +34,15 @@ let lastError = null;
 let phoneInUse = null;
 let startLock = null;
 let restartPending = false;
+
+const AGENT_TASKS = createAgentTaskStore(DATA_DIR);
+const AI = createAiAgent({
+  dataDir: DATA_DIR,
+  store: CRM,
+  getSocket: () => sock,
+  getConnectionStatus: () => status,
+  taskStore: AGENT_TASKS
+});
 
 function secure(req, res, next) {
   const provided = req.get('x-api-key') || '';
@@ -132,6 +143,15 @@ async function startSession(mode, phone = null) {
     });
 
     CRM.attach(sock);
+    sock.ev.on('messages.upsert', ({ messages = [] }) => {
+      for (const raw of messages) {
+        const jid = raw?.key?.remoteJid;
+        const id = raw?.key?.id;
+        if (!jid || !id) continue;
+        const saved = CRM.getMessages(jid, 8).find(m => m.id === id);
+        if (saved) AI.handleIncoming(saved).catch(error => console.error('[ai] incoming failed', error?.message || error));
+      }
+    });
     sock.ev.on('creds.update', saveCreds);
     sock.ev.on('connection.update', async update => {
       if (update.connection) status = update.connection;
@@ -349,6 +369,62 @@ app.post('/crm/resync', secure, async (_req, res) => {
   await sock.resyncAppState(collections, true);
   const groups = await CRM.syncGroups(sock).catch(() => 0);
   res.json({ ok: true, groups });
+});
+
+app.get('/crm/ai/status', secure, (_req, res) => {
+  res.json(AI.status());
+});
+
+app.post('/crm/ai/mode', secure, (req, res) => {
+  try {
+    res.json(AI.setMode(req.body?.mode));
+  } catch (error) {
+    res.status(400).json({ error: error?.message || 'invalid_ai_mode' });
+  }
+});
+
+app.get('/crm/ai/suggestions', secure, (_req, res) => {
+  res.json({ suggestions: AI.listSuggestions() });
+});
+
+app.post('/crm/ai/approve', secure, async (req, res) => {
+  try {
+    const jid = String(req.body?.jid || '');
+    if (!jid) return res.status(400).json({ error: 'missing_jid' });
+    res.json(await AI.approveSuggestion(jid));
+  } catch (error) {
+    res.status(400).json({ error: error?.message || String(error) });
+  }
+});
+
+app.post('/crm/ai/dismiss', secure, (req, res) => {
+  const jid = String(req.body?.jid || '');
+  if (!jid) return res.status(400).json({ error: 'missing_jid' });
+  res.json({ ok: AI.dismissSuggestion(jid) });
+});
+
+app.get('/crm/ai/logs', secure, (req, res) => {
+  res.json({ logs: AI.logs(req.query.limit || 100) });
+});
+
+app.get('/crm/agent-tasks', secure, (req, res) => {
+  res.json({ tasks: AGENT_TASKS.listTasks({
+    status: req.query.status ? String(req.query.status) : null,
+    specialistAgent: req.query.specialistAgent ? String(req.query.specialistAgent) : null
+  }) });
+});
+
+app.post('/crm/agent-tasks/update', secure, (req, res) => {
+  const id = String(req.body?.id || '');
+  if (!id) return res.status(400).json({ error: 'missing_task_id' });
+  const task = AGENT_TASKS.updateTask(id, {
+    status: req.body?.status,
+    outputs: req.body?.outputs ?? undefined,
+    requiresHuman: req.body?.requiresHuman ?? undefined,
+    confidence: req.body?.confidence ?? undefined
+  }, String(req.body?.by || 'crm'));
+  if (!task) return res.status(404).json({ error: 'task_not_found' });
+  res.json({ ok: true, task });
 });
 
 app.post('/connect/phone', secure, async (req, res) => {
