@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import { createCrmStore } from './crm-store.mjs';
 import { createAiAgent } from './ai-agent.mjs';
 import { createAgentTaskStore } from './agent-task-store.mjs';
+import { createKeroDomainStore } from './kero-domain-store.mjs';
 
 const app = express();
 app.use(express.json({ limit: '24mb' }));
@@ -36,6 +37,7 @@ let startLock = null;
 let restartPending = false;
 
 const AGENT_TASKS = createAgentTaskStore(DATA_DIR);
+const KERO_DOMAIN = createKeroDomainStore(DATA_DIR);
 const AI = createAiAgent({
   dataDir: DATA_DIR,
   store: CRM,
@@ -425,6 +427,129 @@ app.post('/crm/agent-tasks/update', secure, (req, res) => {
   }, String(req.body?.by || 'crm'));
   if (!task) return res.status(404).json({ error: 'task_not_found' });
   res.json({ ok: true, task });
+});
+
+
+app.get('/crm/ops/today', secure, (req, res) => {
+  const date = req.query.date ? String(req.query.date) : new Date();
+  res.json({ services: KERO_DOMAIN.todayServices(date) });
+});
+
+app.get('/crm/services', secure, (req, res) => {
+  const date = req.query.date ? String(req.query.date) : null;
+  const statusFilter = req.query.status ? String(req.query.status) : null;
+  res.json({ services: KERO_DOMAIN.listServices({ date, status: statusFilter }) });
+});
+
+app.get('/crm/services/:id', secure, (req, res) => {
+  const service = KERO_DOMAIN.getService(String(req.params.id || ''));
+  if (!service) return res.status(404).json({ error: 'service_not_found' });
+  res.json({ service });
+});
+
+app.post('/crm/services', secure, (req, res) => {
+  try {
+    res.json({ service: KERO_DOMAIN.createService(req.body || {}) });
+  } catch (error) {
+    res.status(400).json({ error: error?.message || String(error) });
+  }
+});
+
+app.post('/crm/services/update', secure, (req, res) => {
+  const id = String(req.body?.id || '');
+  if (!id) return res.status(400).json({ error: 'missing_service_id' });
+  const service = KERO_DOMAIN.updateService(id, req.body?.patch || {}, String(req.body?.actor || 'crm'));
+  if (!service) return res.status(404).json({ error: 'service_not_found' });
+  res.json({ service });
+});
+
+app.post('/crm/services/status', secure, (req, res) => {
+  const id = String(req.body?.id || '');
+  const next = String(req.body?.status || '');
+  if (!id || !next) return res.status(400).json({ error: 'id_and_status_required' });
+  const service = KERO_DOMAIN.setStatus(id, next, String(req.body?.actor || 'crm'), req.body?.meta || {});
+  if (!service) return res.status(404).json({ error: 'service_not_found' });
+  res.json({ service });
+});
+
+app.post('/crm/services/assign', secure, (req, res) => {
+  const id = String(req.body?.id || '');
+  if (!id) return res.status(400).json({ error: 'missing_service_id' });
+  const service = KERO_DOMAIN.assignCourier(id, req.body || {});
+  if (!service) return res.status(404).json({ error: 'service_not_found' });
+  res.json({ service });
+});
+
+app.post('/crm/services/proof', secure, (req, res) => {
+  const id = String(req.body?.id || '');
+  if (!id) return res.status(400).json({ error: 'missing_service_id' });
+  const proof = KERO_DOMAIN.addProof(id, req.body?.proof || {}, String(req.body?.actor || 'crm'));
+  if (!proof) return res.status(404).json({ error: 'service_not_found' });
+  res.json({ proof });
+});
+
+app.post('/crm/services/client-paid', secure, (req, res) => {
+  const id = String(req.body?.id || '');
+  if (!id) return res.status(400).json({ error: 'missing_service_id' });
+  const service = KERO_DOMAIN.markClientPaid(id, req.body || {});
+  if (!service) return res.status(404).json({ error: 'service_not_found' });
+  res.json({ service });
+});
+
+app.post('/crm/services/courier-paid', secure, (req, res) => {
+  const id = String(req.body?.id || '');
+  if (!id) return res.status(400).json({ error: 'missing_service_id' });
+  const service = KERO_DOMAIN.markCourierPaid(id, req.body || {});
+  if (!service) return res.status(404).json({ error: 'service_not_found' });
+  res.json({ service });
+});
+
+app.post('/crm/services/points', secure, (req, res) => {
+  const id = String(req.body?.id || '');
+  if (!id) return res.status(400).json({ error: 'missing_service_id' });
+  const ledger = KERO_DOMAIN.recordPoints(id, {
+    isSaturdayOrHoliday: !!req.body?.isSaturdayOrHoliday,
+    actor: String(req.body?.actor || 'crm')
+  });
+  if (!ledger) return res.status(404).json({ error: 'service_not_found' });
+  res.json({ ledger });
+});
+
+app.post('/crm/clients/upsert', secure, (req, res) => {
+  try {
+    const id = String(req.body?.id || '');
+    res.json({ client: KERO_DOMAIN.upsertClient(id, req.body?.client || {}, String(req.body?.actor || 'crm')) });
+  } catch (error) {
+    res.status(400).json({ error: error?.message || String(error) });
+  }
+});
+
+app.post('/crm/couriers/upsert', secure, (req, res) => {
+  try {
+    const id = String(req.body?.id || '');
+    res.json({ courier: KERO_DOMAIN.upsertCourier(id, req.body?.courier || {}, String(req.body?.actor || 'crm')) });
+  } catch (error) {
+    res.status(400).json({ error: error?.message || String(error) });
+  }
+});
+
+app.post('/crm/customer-procedure', secure, (req, res) => {
+  const clientId = String(req.body?.clientId || '');
+  if (!clientId) return res.status(400).json({ error: 'missing_client_id' });
+  res.json({ procedure: KERO_DOMAIN.setCustomerProcedure(clientId, req.body?.procedure || {}, String(req.body?.actor || 'crm')) });
+});
+
+app.post('/crm/group-override', secure, (req, res) => {
+  const groupId = String(req.body?.groupId || '');
+  if (!groupId) return res.status(400).json({ error: 'missing_group_id' });
+  res.json({ policy: KERO_DOMAIN.setGroupOverride(groupId, req.body?.policy || {}, String(req.body?.actor || 'crm')) });
+});
+
+app.post('/crm/billed-daily-summary', secure, (req, res) => {
+  const clientId = String(req.body?.clientId || '');
+  const date = String(req.body?.date || '');
+  if (!clientId || !date) return res.status(400).json({ error: 'client_id_and_date_required' });
+  res.json({ summary: KERO_DOMAIN.saveBilledDailySummary(clientId, date, req.body?.summary || {}, String(req.body?.actor || 'crm')) });
 });
 
 app.post('/connect/phone', secure, async (req, res) => {

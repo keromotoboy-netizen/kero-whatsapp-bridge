@@ -1,0 +1,85 @@
+{
+  "spreadsheetId": "1n0oF5ujVsVEH2lR91wPlX4T1ljbjlIuZMYYxHNKotw0",
+  "title": "Faturamento Kero Motoboy  2026",
+  "sourceOfTruth": "crm",
+  "sheetAs": "controlled_mirror",
+  "monthlyTabs": true,
+  "headerRow": 7,
+  "columns": {
+    "A": {
+      "field": "serviceDate",
+      "label": "DATA"
+    },
+    "B": {
+      "field": "clientName",
+      "label": "CLIENTE"
+    },
+    "C": {
+      "field": "clientValue",
+      "label": "VALOR"
+    },
+    "D": {
+      "field": "clientPaymentStatus",
+      "label": "Pagamento"
+    },
+    "E": {
+      "field": null,
+      "label": "reserved"
+    },
+    "F": {
+      "field": "courierName",
+      "label": "Motoboy"
+    },
+    "G": {
+      "field": "courierPayout",
+      "label": "REPASSE"
+    },
+    "H": {
+      "field": "courierPaymentStatus",
+      "label": "MOTOBOY PAGO?"
+    },
+    "I": {
+      "field": "status",
+      "label": "Status"
+    },
+    "J": {
+      "field": "invoiceRequired",
+      "label": "Nota Fiscal?"
+    },
+    "K": {
+      "field": "closingLabel",
+      "label": "F/VICTÓRIA"
+    },
+    "L": {
+      "field": "allocationLabel",
+      "label": "ALOCAÇÃO"
+    },
+    "M": {
+      "field": "evaluation",
+      "label": "Avaliação"
+    },
+    "N": {
+      "field": "extrasSummary",
+      "label": "Extras"
+    },
+    "O": {
+      "field": null,
+      "label": "F/Ana Clara",
+      "policy": "historical_only_do_not_write_new"
+    },
+    "P": {
+      "field": null,
+      "label": "Alocação antiga",
+      "policy": "historical_only_do_not_write_new"
+    }
+  },
+  "rules": {
+    "invoicedPaymentDisplay": "FAT MENSAL",
+    "paidDisplay": "PAGO",
+    "notPaidDisplay": "",
+    "invoiceYes": "Sim",
+    "invoiceNo": "nao",
+    "victoriaOnlyPoints": true,
+    "neverOverwriteHistoricalAnaColumns": true
+  }
+}
