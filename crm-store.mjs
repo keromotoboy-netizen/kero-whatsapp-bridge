@@ -303,6 +303,20 @@ export function createCrmStore(dataDir) {
       .sort((a,b) => b.lastMessageTimestamp - a.lastMessageTimestamp);
   };
 
+  const resolveSendJid = jid => {
+    const value = String(jid || '');
+    if (!value || value.endsWith('@g.us') || value.endsWith('@s.whatsapp.net')) return value;
+    if (value.endsWith('@lid')) {
+      const mapped = state.lidMap[value];
+      if (mapped && String(mapped).endsWith('@s.whatsapp.net')) return String(mapped);
+      const contact = contactFor(value);
+      if (contact?.phoneNumber && String(contact.phoneNumber).endsWith('@s.whatsapp.net')) {
+        return String(contact.phoneNumber);
+      }
+    }
+    return value;
+  };
+
   const getMessages = (jid, limit = 100) => {
     const arr = state.messages[jid] || [];
     return arr.slice(Math.max(0, arr.length - Math.min(500, Math.max(1, Number(limit) || 100))));
@@ -313,15 +327,28 @@ export function createCrmStore(dataDir) {
     if (!chat) return;
     chat.unreadCount = 0;
     touch();
-  };  const snapshot = ({ archived = false, search = '', labelId = '' } = {}) => ({
-    rev: state.rev,
-    updatedAt: state.updatedAt,
-    chats: listChats({ archived, search, labelId }),
-    labels: Object.values(state.labels).filter(x => !x.deleted),
-    groups: Object.values(state.groups).sort((a,b) => String(a.subject).localeCompare(String(b.subject))),
-    archivedCount: Object.values(state.chats).filter(c => !!c.archived).length,
-    unreadTotal: Object.values(state.chats).reduce((n,c) => n + Number(c.unreadCount || 0), 0)
-  });
+  };
+
+  const snapshot = ({ archived = false, search = '', labelId = '', limit = 0, offset = 0, includeMeta = true } = {}) => {
+    const allChats = listChats({ archived, search, labelId });
+    const safeOffset = Math.max(0, Number(offset) || 0);
+    const safeLimit = Math.max(0, Number(limit) || 0);
+    const chats = safeLimit > 0
+      ? allChats.slice(safeOffset, safeOffset + safeLimit)
+      : allChats.slice(safeOffset);
+
+    return {
+      rev: state.rev,
+      updatedAt: state.updatedAt,
+      chats,
+      totalChats: allChats.length,
+      hasMore: safeLimit > 0 ? safeOffset + chats.length < allChats.length : false,
+      labels: includeMeta ? Object.values(state.labels).filter(x => !x.deleted) : [],
+      groups: includeMeta ? Object.values(state.groups).sort((a,b) => String(a.subject).localeCompare(String(b.subject))) : [],
+      archivedCount: Object.values(state.chats).filter(c => !!c.archived).length,
+      unreadTotal: Object.values(state.chats).reduce((n,c) => n + Number(c.unreadCount || 0), 0)
+    };
+  };
 
   const attach = sock => {
     sock.ev.on('messaging-history.set', mergeHistory);
@@ -357,6 +384,7 @@ export function createCrmStore(dataDir) {
     upsertLidMapping,
     upsertPresence,
     snapshot,
+    resolveSendJid,
     getMessages,
     markReadLocal,
     saveNow

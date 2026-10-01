@@ -79,6 +79,17 @@ async function resolveStoredLids() {
   return total;
 }
 
+async function resolveOutboundJid(jid) {
+  const value = String(jid || '');
+  const stored = CRM.resolveSendJid(value);
+  if (!value.endsWith('@lid') || stored !== value) return stored;
+
+  const mappings = await sock?.signalRepository?.lidMapping?.getPNsForLIDs?.([value]).catch(() => null);
+  for (const mapping of mappings || []) CRM.upsertLidMapping(mapping);
+
+  return CRM.resolveSendJid(value);
+}
+
 async function stopSocket() {
   try {
     if (sock?.ws) sock.ws.close();
@@ -293,7 +304,10 @@ app.get('/crm/snapshot', secure, (req, res) => {
   const archived = String(req.query.archived || '') === '1';
   const search = String(req.query.search || '');
   const labelId = String(req.query.labelId || '');
-  res.json(CRM.snapshot({ archived, search, labelId }));
+  const limit = Math.min(500, Math.max(0, Number(req.query.limit || 0)));
+  const offset = Math.max(0, Number(req.query.offset || 0));
+  const includeMeta = String(req.query.includeMeta ?? '1') !== '0';
+  res.json(CRM.snapshot({ archived, search, labelId, limit, offset, includeMeta }));
 });
 
 app.get('/crm/messages', secure, (req, res) => {
@@ -321,9 +335,25 @@ app.post('/crm/send', secure, async (req, res) => {
   const text = String(req.body?.text || '').trim();
   if (!jid || !text) return res.status(400).json({ error: 'jid_and_text_required' });
   if (!sock || status !== 'open') return res.status(409).json({ error: 'whatsapp_not_connected' });
-  const sent = await sock.sendMessage(jid, { text });
-  if (sent) CRM.upsertMessage(sent);
-  res.json({ ok: true, messageId: sent?.key?.id || null });
+
+  try {
+    const targetJid = await resolveOutboundJid(jid);
+    if (jid.endsWith('@lid') && targetJid === jid) {
+      return res.status(409).json({ error: 'contact_number_still_syncing' });
+    }
+    const sent = await sock.sendMessage(targetJid, { text });
+    if (sent) CRM.upsertMessage(sent);
+    res.json({ ok: true, messageId: sent?.key?.id || null, resolved: targetJid !== jid });
+  } catch (error) {
+    console.error('[crm] send failed', {
+      jid,
+      message: error?.message || String(error)
+    });
+    res.status(502).json({
+      error: 'whatsapp_send_failed',
+      detail: error?.message || String(error)
+    });
+  }
 });
 
 app.post('/crm/send-media', secure, async (req, res) => {
@@ -350,9 +380,25 @@ app.post('/crm/send-media', secure, async (req, res) => {
   if (kind === 'document') content = { document: buffer, mimetype, fileName, caption };
   if (kind === 'audio') content = { audio: buffer, mimetype, ptt };
 
-  const sent = await sock.sendMessage(jid, content);
-  if (sent) CRM.upsertMessage(sent);
-  res.json({ ok: true, messageId: sent?.key?.id || null });
+  try {
+    const targetJid = await resolveOutboundJid(jid);
+    if (jid.endsWith('@lid') && targetJid === jid) {
+      return res.status(409).json({ error: 'contact_number_still_syncing' });
+    }
+    const sent = await sock.sendMessage(targetJid, content);
+    if (sent) CRM.upsertMessage(sent);
+    res.json({ ok: true, messageId: sent?.key?.id || null, resolved: targetJid !== jid });
+  } catch (error) {
+    console.error('[crm] media send failed', {
+      jid,
+      kind,
+      message: error?.message || String(error)
+    });
+    res.status(502).json({
+      error: 'whatsapp_send_failed',
+      detail: error?.message || String(error)
+    });
+  }
 });
 
 app.post('/crm/read', secure, (req, res) => {
