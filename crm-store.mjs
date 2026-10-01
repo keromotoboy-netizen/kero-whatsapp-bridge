@@ -318,15 +318,35 @@ export function createCrmStore(dataDir) {
   };
 
   const getMessages = (jid, limit = 100) => {
-    const arr = state.messages[jid] || [];
-    return arr.slice(Math.max(0, arr.length - Math.min(500, Math.max(1, Number(limit) || 100))));
+    const alias = state.lidMap[jid];
+    const ids = [...new Set([jid, alias].filter(Boolean))];
+    const byId = new Map();
+
+    for (const id of ids) {
+      for (const message of state.messages[id] || []) {
+        const key = String(message?.id || '') + '|' + String(message?.fromMe ? 1 : 0);
+        const current = byId.get(key);
+        if (!current || Number(message?.timestamp || 0) >= Number(current?.timestamp || 0)) {
+          byId.set(key, message);
+        }
+      }
+    }
+
+    const arr = [...byId.values()].sort((a,b) => Number(a?.timestamp || 0) - Number(b?.timestamp || 0));
+    const safeLimit = Math.min(500, Math.max(1, Number(limit) || 100));
+    return arr.slice(Math.max(0, arr.length - safeLimit));
   };
 
   const markReadLocal = jid => {
-    const chat = ensureChat(jid);
-    if (!chat) return;
-    chat.unreadCount = 0;
-    touch();
+    const ids = [...new Set([jid, state.lidMap[jid]].filter(Boolean))];
+    let changed = false;
+    for (const id of ids) {
+      const chat = ensureChat(id);
+      if (!chat) continue;
+      if (chat.unreadCount) changed = true;
+      chat.unreadCount = 0;
+    }
+    if (changed) touch();
   };
 
   const snapshot = ({ archived = false, search = '', labelId = '', limit = 0, offset = 0, includeMeta = true } = {}) => {
