@@ -32,6 +32,7 @@ let lastError = null;
 let phoneInUse = null;
 let startLock = null;
 let restartPending = false;
+let reconnectAttempt = 0;
 
 function secure(req, res, next) {
   const provided = req.get('x-api-key') || '';
@@ -159,6 +160,7 @@ async function startSession(mode, phone = null) {
       if (update.connection === 'open') {
         status = 'open';
         restartPending = false;
+        reconnectAttempt = 0;
         latestQr = null;
         latestQrDataUrl = null;
         pairingCode = null;
@@ -177,14 +179,32 @@ async function startSession(mode, phone = null) {
 
         console.log(`[wa] connection closed code=${code ?? 'unknown'} mode=${mode}`);
 
-        if (code === DisconnectReason.restartRequired || code === 515) {
+        const loggedOut = code === DisconnectReason.loggedOut;
+        const hasSavedSession = !!state?.creds?.registered;
+        const shouldReconnect = !loggedOut && hasSavedSession;
+
+        if (shouldReconnect) {
+          const immediate = code === DisconnectReason.restartRequired || code === 515;
+          const delay = immediate
+            ? 0
+            : Math.min(60000, 1000 * (2 ** Math.min(reconnectAttempt, 5)));
+
           status = 'restarting';
-          lastError = null;
+          lastError = {
+            stage: 'connection',
+            code,
+            message: error?.message || 'Connection closed',
+            loggedOut: false,
+            retrying: true,
+            retryInMs: delay
+          };
 
           if (!restartPending) {
             restartPending = true;
+            reconnectAttempt++;
             const resumePhone = phoneInUse;
-            console.log('[wa] restartRequired (515): reconnecting immediately with saved credentials');
+            console.log('[wa] transient disconnect: reconnecting with saved credentials in ' + delay + 'ms');
+
             setTimeout(async () => {
               try {
                 while (startLock) await sleep(25);
@@ -192,14 +212,25 @@ async function startSession(mode, phone = null) {
                 await startSession('resume', resumePhone);
               } catch (restartError) {
                 lastError = {
-                  stage: 'restartRequired',
-                  code: 515,
-                  message: restartError?.message || String(restartError)
+                  stage: 'autoReconnect',
+                  code,
+                  message: restartError?.message || String(restartError),
+                  loggedOut: false,
+                  retrying: true
                 };
                 status = 'close';
                 restartPending = false;
+
+                const retryDelay = Math.min(60000, 1000 * (2 ** Math.min(reconnectAttempt, 5)));
+                setTimeout(() => {
+                  if (!restartPending && status !== 'open') {
+                    startSession('resume', resumePhone).catch(e => {
+                      console.error('[wa] delayed reconnect failed', e?.message || e);
+                    });
+                  }
+                }, retryDelay);
               }
-            }, 0);
+            }, delay);
           }
           return;
         }
@@ -209,7 +240,7 @@ async function startSession(mode, phone = null) {
           stage: 'connection',
           code,
           message: error?.message || 'Connection closed',
-          loggedOut: code === DisconnectReason.loggedOut
+          loggedOut
         };
         status = 'close';
       }
