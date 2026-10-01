@@ -192,7 +192,10 @@ async function startSession(mode, phone = null) {
 
         const loggedOut = code === DisconnectReason.loggedOut;
         const hasSavedSession = !!state?.creds?.registered;
-        const shouldReconnect = !loggedOut && hasSavedSession;
+        const hasPersistedCredentials = fs.existsSync(DATA_DIR + '/creds.json');
+        const shouldReconnect =
+          !loggedOut &&
+          (mode === 'resume' || hasSavedSession || hasPersistedCredentials);
 
         if (shouldReconnect) {
           const immediate = code === DisconnectReason.restartRequired || code === 515;
