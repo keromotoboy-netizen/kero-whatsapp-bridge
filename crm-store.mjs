@@ -154,7 +154,7 @@ export function createCrmStore(dataDir) {
     touch();
   };
 
-  const upsertMessage = raw => {
+  const upsertMessage = (raw, { countUnread = true } = {}) => {
     const jid = raw?.key?.remoteJid;
     if (!jid || jid === 'status@broadcast') return;
     const id = raw?.key?.id;
@@ -195,7 +195,7 @@ export function createCrmStore(dataDir) {
     chat.lastMessageTimestamp = ts;
     chat.lastMessage = item.text;
     if (raw.pushName && !chat.pushName) chat.pushName = raw.pushName;
-    if (!item.fromMe) chat.unreadCount = Number(chat.unreadCount || 0) + 1;
+    if (countUnread && idx < 0 && !item.fromMe) chat.unreadCount = Number(chat.unreadCount || 0) + 1;
     touch();
   };
 
@@ -203,7 +203,7 @@ export function createCrmStore(dataDir) {
     for (const map of payload?.lidPnMappings || []) upsertLidMapping(map);
     for (const c of payload?.contacts || []) upsertContact(c);
     for (const c of payload?.chats || []) upsertChat(c);
-    for (const m of payload?.messages || []) upsertMessage(m);
+    for (const m of payload?.messages || []) upsertMessage(m, { countUnread: false });
   };
 
   const markDeleted = payload => {
@@ -377,7 +377,7 @@ export function createCrmStore(dataDir) {
     sock.ev.on('contacts.upsert', contacts => contacts.forEach(upsertContact));
     sock.ev.on('contacts.update', contacts => contacts.forEach(upsertContact));
     sock.ev.on('lid-mapping.update', upsertLidMapping);
-    sock.ev.on('messages.upsert', ({ messages }) => messages.forEach(upsertMessage));
+    sock.ev.on('messages.upsert', ({ messages, type }) => messages.forEach(m => upsertMessage(m, { countUnread: type === 'notify' })));
     sock.ev.on('messages.update', handleMessageUpdates);
     sock.ev.on('messages.delete', markDeleted);
     sock.ev.on('presence.update', upsertPresence);
