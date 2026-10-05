@@ -448,6 +448,123 @@ app.post('/connect/phone', secure, async (req, res) => {
   }
 });
 
+
+// KERO_MAINTENANCE_V1
+const TEMP_LABEL_NAMES = new Set(['📌Cliente do dia', '📌 Cliente do dia', 'Pagamento de Motoboy/Motorista']);
+const CLIENT_GROUP_LABEL_NAME = 'Grupos com clientes';
+const PROFESSIONAL_LABEL_NAMES = new Set(['Grupos 1,50 km','Grupos 2,00 km','Carros & Utilitarios','Carros & Utilitários','Encaixe acima de 70km','Min 20$ até 6km']);
+const CLIENT_GROUP_PATTERNS = [
+  /dunelli/i,/harmonia/i,/lm\s*melo/i,/resgatando\s*vidas/i,/time\s*atendimento/i,
+  /grupo\s*de\s*o\.?\s*s\.?/i,/protocolos?\s*malotes?\s*larcon/i,/larcon/i,
+  /diagn[oó]stica/i,/cientifica|cient[ií]fica/i,/dcbm/i,/data\s*center\s*brasil/i,
+  /construtora\s*metrocasa/i,/bella\s*fit/i,/estante\s*m[aá]gica/i,
+  /igrejas?.*vener/i,/vener[aá]vel/i,/semana\s*light/i,/chocolate\s*sp/i
+];
+const PROFESSIONAL_GROUP_PATTERNS = [
+  /motoboy/i,/motofrete/i,/motofretista/i,/moto\s*frete/i,/motorista/i,/portador/i,
+  /viagens?/i,/encaixe/i,/localiza[cç][aã]o/i,/s[oó]\s*rotas/i,/brasil\s*transportes/i,
+  /brasil\s*express/i,/conex[aã]o\s*motoboy/i,/equipe\s*r1/i,/parceria\s*motofretistas/i,
+  /uni[aã]o\s*dos\s*motoboys/i
+];
+const maintenanceFile = DATA_DIR + '/../kero-maintenance-state.json';
+let maintenanceState = { lastDate: null, lastRun: null, lastResult: null };
+try { if (fs.existsSync(maintenanceFile)) maintenanceState = { ...maintenanceState, ...JSON.parse(fs.readFileSync(maintenanceFile,'utf8')) }; } catch {}
+const saveMaintenance = () => { try { fs.writeFileSync(maintenanceFile, JSON.stringify(maintenanceState, null, 2)); } catch {} };
+const norm = v => String(v || '').normalize('NFD').replace(/[\u0300-\u036f]/g,'').trim();
+const labelsByName = () => new Map(Object.values(CRM.state.labels || {}).filter(x=>!x.deleted).map(x=>[norm(x.name).toLowerCase(), String(x.id)]));
+const isClientGroup = g => CLIENT_GROUP_PATTERNS.some(rx => rx.test(String(g?.subject || '')));
+const isProfessionalGroup = g => {
+  if (!g?.id?.endsWith('@g.us') || isClientGroup(g)) return false;
+  const byId = new Map(Object.values(CRM.state.labels || {}).filter(x=>!x.deleted).map(x=>[String(x.id), norm(x.name)]));
+  const names = (CRM.state.chatLabels[g.id] || []).map(id=>byId.get(String(id))).filter(Boolean);
+  if (names.some(n=>PROFESSIONAL_LABEL_NAMES.has(n))) return true;
+  return PROFESSIONAL_GROUP_PATTERNS.some(rx=>rx.test(String(g.subject || '')));
+};
+async function ensureClientGroupLabel(dryRun=false) {
+  const byName=labelsByName(); let id=byName.get(CLIENT_GROUP_LABEL_NAME.toLowerCase());
+  if (!id) {
+    const nums=Object.keys(CRM.state.labels||{}).map(Number).filter(Number.isFinite);
+    id=String((nums.length?Math.max(...nums):40)+1);
+    if (!dryRun) {
+      await sock.chatModify({ addLabel:{ id, name:CLIENT_GROUP_LABEL_NAME, color:1, deleted:false } }, '');
+      CRM.state.labels[id]={id,name:CLIENT_GROUP_LABEL_NAME,color:1,deleted:false}; CRM.saveNow();
+    }
+  }
+  const targets=Object.values(CRM.state.groups||{}).filter(isClientGroup);
+  const applied=[];
+  for(const g of targets){
+    if (!(CRM.state.chatLabels[g.id]||[]).map(String).includes(String(id))) {
+      if(!dryRun) {
+        await sock.chatModify({ addChatLabel:{ labelId:String(id) } }, g.id);
+        CRM.state.chatLabels[g.id]=[...new Set([...(CRM.state.chatLabels[g.id]||[]).map(String),String(id)])];
+      }
+      applied.push({id:g.id,name:g.subject});
+      if(!dryRun) await sleep(180);
+    }
+  }
+  if(!dryRun) CRM.saveNow();
+  return {labelId:id,targets:targets.map(g=>({id:g.id,name:g.subject})),applied};
+}
+async function removeTemporaryLabels(dryRun=false){
+  const byName=labelsByName(); const ids=[...TEMP_LABEL_NAMES].map(n=>byName.get(norm(n).toLowerCase())).filter(Boolean);
+  const removed=[];
+  for(const [jid,labs] of Object.entries(CRM.state.chatLabels||{})){
+    if(jid.endsWith('@g.us')) continue;
+    for(const id of ids){
+      if((labs||[]).map(String).includes(String(id))){
+        if(!dryRun) await sock.chatModify({ removeChatLabel:{labelId:String(id)} }, jid);
+        removed.push({jid,labelId:id});
+        if(!dryRun){ CRM.state.chatLabels[jid]=(CRM.state.chatLabels[jid]||[]).map(String).filter(x=>x!==String(id)); await sleep(120); }
+      }
+    }
+  }
+  if(!dryRun) CRM.saveNow();
+  return removed;
+}
+async function clearProfessionalGroups(dryRun=false){
+  const protectedLabelId=labelsByName().get(CLIENT_GROUP_LABEL_NAME.toLowerCase());
+  const results=[];
+  for(const g of Object.values(CRM.state.groups||{})){
+    const labels=(CRM.state.chatLabels[g.id]||[]).map(String);
+    const protectedGroup=isClientGroup(g) || (protectedLabelId && labels.includes(String(protectedLabelId)));
+    if(protectedGroup || !isProfessionalGroup(g)) continue;
+    const msgs=(CRM.getMessages(g.id,500)||[]).filter(m=>!m.deleted);
+    if(!msgs.length){results.push({id:g.id,name:g.subject,cleared:0});continue;}
+    if(!dryRun){
+      const payload=msgs.map(m=>({id:m.id,fromMe:!!m.fromMe,timestamp:String(m.timestamp)}));
+      await sock.chatModify({ clear:{messages:payload} }, g.id);
+      await sleep(250);
+    }
+    results.push({id:g.id,name:g.subject,cleared:msgs.length});
+  }
+  return results;
+}
+async function runKeroMaintenance({dryRun=false}={}){
+  if(!sock || status!=='open') throw new Error('whatsapp_not_connected');
+  const clientLabel=await ensureClientGroupLabel(dryRun);
+  const tempLabels=await removeTemporaryLabels(dryRun);
+  const groups=await clearProfessionalGroups(dryRun);
+  const result={dryRun,at:new Date().toISOString(),clientLabel,tempLabelsRemoved:tempLabels.length,professionalGroups:groups,totalMessages:groups.reduce((n,x)=>n+x.cleared,0)};
+  if(!dryRun){maintenanceState.lastRun=result.at;maintenanceState.lastResult=result;saveMaintenance();}
+  return result;
+}
+app.get('/crm/maintenance/status', secure, (_req,res)=>res.json({ok:true,state:maintenanceState}));
+app.post('/crm/maintenance/run', secure, async (req,res)=>{
+  try { res.json({ok:true,result:await runKeroMaintenance({dryRun:!!req.body?.dryRun})}); }
+  catch(error){ res.status(500).json({error:'maintenance_failed',message:error?.message||String(error)}); }
+});
+setInterval(async ()=>{
+  try{
+    const parts=Object.fromEntries(new Intl.DateTimeFormat('en-CA',{timeZone:'America/Sao_Paulo',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(new Date()).filter(x=>x.type!=='literal').map(x=>[x.type,x.value]));
+    const date=parts.year+'-'+parts.month+'-'+parts.day;
+    if(parts.hour==='00' && Number(parts.minute)<10 && maintenanceState.lastDate!==date && status==='open'){
+      const result=await runKeroMaintenance({dryRun:false});
+      maintenanceState.lastDate=date;maintenanceState.lastResult=result;saveMaintenance();
+      console.log('[maintenance] midnight completed', {date,temp:result.tempLabelsRemoved,groups:result.professionalGroups.length,messages:result.totalMessages});
+    }
+  }catch(error){console.error('[maintenance] midnight failed',error?.message||error);}
+},60000);
+
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Kero WhatsApp Bridge listening on ${PORT}`);
   setTimeout(() => {
