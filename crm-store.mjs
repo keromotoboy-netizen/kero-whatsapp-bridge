@@ -614,6 +614,11 @@ export function createCrmStore(dataDir) {
     return Object.keys(groups || {}).length;
   };
 
+  const close = () => {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+  };
+
   return {
     state,
     attach,
@@ -630,6 +635,7 @@ export function createCrmStore(dataDir) {
     getMessages,
     getMessagesPage,
     markReadLocal,
-    saveNow
+    saveNow,
+    close
   };
 }
