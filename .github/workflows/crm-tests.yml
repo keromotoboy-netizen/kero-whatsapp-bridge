@@ -23,5 +23,6 @@ jobs:
           cache: npm
       - run: npm ci
       - run: node --check crm-store.mjs
+      - run: node --check crm-ai.mjs
       - run: node --check server.mjs
-      - run: node --test crm-store.test.mjs
+      - run: node --test crm-store.test.mjs crm-ai.test.mjs
