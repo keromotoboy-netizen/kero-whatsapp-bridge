@@ -104,8 +104,8 @@ test('memory is limited to the latest 16 non-deleted messages', () => {
     }
     messages[24].deleted = true;
     const memory = ai.memoryFor('7@s.whatsapp.net');
-    assert.equal(memory.length, 15);
-    assert.equal(memory[0].content, 'm9');
+    assert.equal(memory.length, 16);
+    assert.equal(memory[0].content, 'm8');
     assert.equal(memory.at(-1).content, 'm23');
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
