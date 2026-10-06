@@ -39,6 +39,7 @@ test('history is idempotent and never regresses lastMessageTimestamp', () => {
     assert.equal(afterHistory.lastMessageTimestamp, 200);
     assert.equal(afterHistory.lastMessage, 'mais nova');
   } finally {
+    store.close();
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
@@ -57,6 +58,7 @@ test('PN contact name wins over LID placeholder while LID remains addressable', 
     assert.equal(chat.name, 'Cliente Salvo PN');
     assert.equal(store.resolveSendJid(lid), pn);
   } finally {
+    store.close();
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
@@ -118,6 +120,7 @@ test('messages.update refreshes live location monotonically', () => {
     assert.equal(item.location.sequenceNumber, 2);
     assert.equal(item.location.latitude, -23.551);
   } finally {
+    store.close();
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
@@ -151,6 +154,7 @@ test('received media exposes safe preview metadata and thumbnail', () => {
     assert.equal(item.media.fileLength, 12345);
     assert.match(item.media.thumbnail, /^data:image\/jpeg;base64,/);
   } finally {
+    store.close();
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
@@ -177,6 +181,7 @@ test('message history is not truncated at 500 and supports backward pagination',
     assert.equal(page2.messages.at(-1).id, 'm520');
     assert.equal(page2.hasMore, true);
   } finally {
+    store.close();
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
