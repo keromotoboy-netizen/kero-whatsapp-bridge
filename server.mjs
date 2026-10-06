@@ -8,6 +8,7 @@ import QRCode from 'qrcode';
 import pino from 'pino';
 import fs from 'node:fs';
 import { createCrmStore } from './crm-store.mjs';
+import { createCrmAi } from './crm-ai.mjs';
 
 const app = express();
 app.use(express.json({ limit: '24mb' }));
@@ -22,6 +23,7 @@ if (!API_SECRET) {
 }
 fs.mkdirSync(DATA_DIR, { recursive: true });
 const CRM = createCrmStore(DATA_DIR);
+const CRM_AI = createCrmAi({ dataDir: DATA_DIR, crm: CRM });
 
 let sock = null;
 let status = 'idle';
@@ -33,6 +35,8 @@ let phoneInUse = null;
 let startLock = null;
 let restartPending = false;
 let reconnectAttempt = 0;
+let lastCrmResyncAt = 0;
+const CRM_RESYNC_COOLDOWN_MS = Math.max(60000, Number(process.env.CRM_RESYNC_COOLDOWN_MS || 600000));
 
 function secure(req, res, next) {
   const provided = req.get('x-api-key') || '';
@@ -90,6 +94,46 @@ async function resolveOutboundJid(jid) {
   return CRM.resolveSendJid(value);
 }
 
+async function resyncCrmState({ force = false } = {}) {
+  if (!sock || status !== 'open') throw new Error('whatsapp_not_connected');
+  const now = Date.now();
+  if (!force && now - lastCrmResyncAt < CRM_RESYNC_COOLDOWN_MS) {
+    return { skipped: true, reason: 'cooldown', nextAt: lastCrmResyncAt + CRM_RESYNC_COOLDOWN_MS };
+  }
+
+  const collections = ['critical_unblock_low','regular_high','regular_low','critical_block','regular'];
+  await sock.resyncAppState(collections, true);
+  const groups = await CRM.syncGroups(sock).catch(() => 0);
+  const lids = await resolveStoredLids().catch(() => 0);
+  lastCrmResyncAt = Date.now();
+  return { skipped: false, groups, lids, at: new Date(lastCrmResyncAt).toISOString() };
+}
+
+async function handleAiIncoming(payload) {
+  if (payload?.type !== 'notify') return;
+  for (const raw of payload?.messages || []) {
+    const jid = String(raw?.key?.remoteJid || '');
+    if (!jid || jid === 'status@broadcast' || raw?.key?.fromMe) continue;
+
+    const stored = (CRM.getMessages(jid, 20) || []).find(item => item?.id === raw?.key?.id);
+    const text = String(stored?.text || '').trim();
+    if (!text || text === '[Mensagem]') continue;
+
+    const decision = await CRM_AI.processIncoming({ jid, text });
+    if (decision.action !== 'send') continue;
+    if (!sock || status !== 'open') continue;
+
+    const targetJid = await resolveOutboundJid(jid);
+    if (jid.endsWith('@lid') && targetJid === jid) continue;
+
+    const sent = await sock.sendMessage(targetJid, { text: decision.suggestion });
+    if (sent) CRM.upsertMessage(sent);
+    if (decision.suggestionId) {
+      CRM_AI.reviewSuggestion({ jid, id: decision.suggestionId, status: 'sent' });
+    }
+  }
+}
+
 async function stopSocket() {
   try {
     if (sock?.ws) sock.ws.close();
@@ -144,6 +188,11 @@ async function startSession(mode, phone = null) {
     });
 
     CRM.attach(sock);
+    sock.ev.on('messages.upsert', payload => {
+      handleAiIncoming(payload).catch(error => {
+        console.error('[crm-ai] incoming processing failed', error?.message || error);
+      });
+    });
     sock.ev.on('creds.update', saveCreds);
     sock.ev.on('connection.update', async update => {
       if (update.connection) status = update.connection;
@@ -177,8 +226,11 @@ async function startSession(mode, phone = null) {
         pairingCode = null;
         lastError = null;
         console.log('[wa] connected successfully');
-        CRM.syncGroups(sock).then(n => console.log('[crm] groups synced=' + n)).catch(e => console.error('[crm] group sync failed', e?.message || e));
-        setTimeout(() => resolveStoredLids().then(n => console.log('[crm] lid mappings resolved=' + n)).catch(e => console.error('[crm] lid resolve failed', e?.message || e)), 1200);
+        setTimeout(() => {
+          resyncCrmState({ force: false })
+            .then(result => console.log('[crm] resync completed', result))
+            .catch(error => console.error('[crm] resync failed', error?.message || error));
+        }, 1200);
       }
 
       if (update.connection === 'close') {
@@ -317,7 +369,50 @@ app.get('/crm/messages', secure, (req, res) => {
   const jid = String(req.query.jid || '');
   if (!jid) return res.status(400).json({ error: 'missing_jid' });
   const limit = Math.min(500, Math.max(1, Number(req.query.limit || 120)));
-  res.json({ jid, messages: CRM.getMessages(jid, limit) });
+  const before = Math.max(0, Number(req.query.before || 0));
+  const offset = Math.max(0, Number(req.query.offset || 0));
+  res.json(CRM.getMessagesPage(jid, { limit, before, offset }));
+});
+
+app.get('/crm/ai/status', secure, (req, res) => {
+  const jid = String(req.query.jid || '');
+  res.json({ ok: true, ...CRM_AI.status(jid || null) });
+});
+
+app.post('/crm/ai/mode', secure, (req, res) => {
+  try {
+    const jid = req.body?.jid ? String(req.body.jid) : null;
+    const mode = String(req.body?.mode || '');
+    res.json({ ok: true, ...CRM_AI.configure({ mode, jid }) });
+  } catch (error) {
+    res.status(400).json({ error: 'invalid_ai_mode', message: error?.message || String(error) });
+  }
+});
+
+app.get('/crm/ai/suggestions', secure, (req, res) => {
+  const jid = String(req.query.jid || '');
+  if (!jid) return res.status(400).json({ error: 'missing_jid' });
+  const limit = Math.min(100, Math.max(1, Number(req.query.limit || 20)));
+  res.json({ ok: true, jid, suggestions: CRM_AI.listSuggestions(jid, { limit }) });
+});
+
+app.post('/crm/ai/suggestions/review', secure, (req, res) => {
+  try {
+    const jid = String(req.body?.jid || '');
+    const id = String(req.body?.id || '');
+    const reviewStatus = String(req.body?.status || '');
+    if (!jid || !id) return res.status(400).json({ error: 'jid_and_id_required' });
+    const suggestion = CRM_AI.reviewSuggestion({ jid, id, status: reviewStatus });
+    res.json({ ok: true, suggestion });
+  } catch (error) {
+    res.status(400).json({ error: 'suggestion_review_failed', message: error?.message || String(error) });
+  }
+});
+
+app.get('/crm/ai/audit', secure, (req, res) => {
+  const jid = req.query.jid ? String(req.query.jid) : null;
+  const limit = Math.min(500, Math.max(1, Number(req.query.limit || 100)));
+  res.json({ ok: true, audits: CRM_AI.listAudits({ jid, limit }) });
 });
 
 app.get('/crm/avatar', secure, async (req, res) => {
@@ -425,10 +520,12 @@ app.post('/crm/presence', secure, async (req, res) => {
 
 app.post('/crm/resync', secure, async (_req, res) => {
   if (!sock || status !== 'open') return res.status(409).json({ error: 'whatsapp_not_connected' });
-  const collections = ['critical_unblock_low','regular_high','regular_low','critical_block','regular'];
-  await sock.resyncAppState(collections, true);
-  const groups = await CRM.syncGroups(sock).catch(() => 0);
-  res.json({ ok: true, groups });
+  try {
+    const result = await resyncCrmState({ force: true });
+    res.json({ ok: true, ...result });
+  } catch (error) {
+    res.status(502).json({ error: 'crm_resync_failed', message: error?.message || String(error) });
+  }
 });
 
 app.post('/connect/phone', secure, async (req, res) => {
