@@ -600,7 +600,7 @@ async function clearProfessionalGroups(dryRun=false){
     const labels=(CRM.state.chatLabels[g.id]||[]).map(String);
     const protectedGroup=isClientGroup(g) || (protectedLabelId && labels.includes(String(protectedLabelId)));
     if(protectedGroup || !isProfessionalGroup(g)) continue;
-    const msgs=(CRM.getMessages(g.id,500)||[]).filter(m=>!m.deleted);
+    const msgs=(CRM.getMessages(g.id,{limit:500}).messages||[]).filter(m=>!m.deleted);
     if(!msgs.length){results.push({id:g.id,name:g.subject,cleared:0});continue;}
     if(!dryRun){
       const payload=msgs.map(m=>({id:m.id,fromMe:!!m.fromMe,timestamp:String(m.timestamp)}));
