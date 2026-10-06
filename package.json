@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
+    "test": "node --test crm-store.test.mjs crm-ai.test.mjs",
     "postinstall": "patch-package && node scripts/fix-ack.mjs"
   },
   "dependencies": {
