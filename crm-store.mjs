@@ -2,7 +2,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { WAMessageStubType } from 'baileys';
 
-const MAX_MESSAGES_PER_CHAT = 500;
+const configuredMessageCap = Number(process.env.CRM_MAX_MESSAGES_PER_CHAT || 0);
+const MAX_MESSAGES_PER_CHAT =
+  Number.isFinite(configuredMessageCap) && configuredMessageCap > 0
+    ? Math.max(500, Math.min(100000, configuredMessageCap))
+    : 0;
 
 const numberValue = value => {
   if (value == null) return 0;
@@ -45,6 +49,89 @@ const messageType = message => {
   return Object.keys(m)[0] || 'unknown';
 };
 
+const thumbnailDataUrl = (bytes, mimetype = 'image/jpeg') => {
+  if (!bytes) return null;
+  try {
+    const buffer = Buffer.from(bytes);
+    if (!buffer.length) return null;
+    return `data:${mimetype};base64,${buffer.toString('base64')}`;
+  } catch {
+    return null;
+  }
+};
+
+const mediaInfo = message => {
+  const m = unwrapMessage(message);
+  if (!m) return null;
+
+  if (m.imageMessage) {
+    const x = m.imageMessage;
+    return {
+      kind: 'image',
+      mimetype: x.mimetype || 'image/jpeg',
+      fileName: x.fileName || null,
+      width: numberValue(x.width),
+      height: numberValue(x.height),
+      size: numberValue(x.fileLength),
+      duration: 0,
+      thumbnail: thumbnailDataUrl(x.jpegThumbnail, 'image/jpeg')
+    };
+  }
+  if (m.videoMessage) {
+    const x = m.videoMessage;
+    return {
+      kind: 'video',
+      mimetype: x.mimetype || 'video/mp4',
+      fileName: x.fileName || null,
+      width: numberValue(x.width),
+      height: numberValue(x.height),
+      size: numberValue(x.fileLength),
+      duration: numberValue(x.seconds),
+      thumbnail: thumbnailDataUrl(x.jpegThumbnail, 'image/jpeg')
+    };
+  }
+  if (m.documentMessage) {
+    const x = m.documentMessage;
+    return {
+      kind: 'document',
+      mimetype: x.mimetype || 'application/octet-stream',
+      fileName: x.fileName || null,
+      width: 0,
+      height: 0,
+      size: numberValue(x.fileLength),
+      duration: 0,
+      thumbnail: thumbnailDataUrl(x.jpegThumbnail, 'image/jpeg')
+    };
+  }
+  if (m.audioMessage) {
+    const x = m.audioMessage;
+    return {
+      kind: x.ptt ? 'voice' : 'audio',
+      mimetype: x.mimetype || 'audio/ogg',
+      fileName: x.fileName || null,
+      width: 0,
+      height: 0,
+      size: numberValue(x.fileLength),
+      duration: numberValue(x.seconds),
+      thumbnail: null
+    };
+  }
+  if (m.stickerMessage) {
+    const x = m.stickerMessage;
+    return {
+      kind: 'sticker',
+      mimetype: x.mimetype || 'image/webp',
+      fileName: null,
+      width: numberValue(x.width),
+      height: numberValue(x.height),
+      size: numberValue(x.fileLength),
+      duration: 0,
+      thumbnail: thumbnailDataUrl(x.jpegThumbnail, 'image/jpeg')
+    };
+  }
+  return null;
+};
+
 const safeNameFromJid = jid => {
   if (!jid) return 'Sem nome';
   return jid.split('@')[0]?.replace(/\D/g, '') || jid;
@@ -85,6 +172,9 @@ export function createCrmStore(dataDir) {
 
   const contactFor = jid => {
     const mapped = state.lidMap[jid];
+    if (String(jid || '').endsWith('@lid') && mapped && String(mapped).endsWith('@s.whatsapp.net')) {
+      return state.contacts[mapped] || state.contacts[jid] || {};
+    }
     return state.contacts[jid] || (mapped ? state.contacts[mapped] : null) || {};
   };
 
@@ -104,11 +194,19 @@ export function createCrmStore(dataDir) {
     const jid = input?.id;
     if (!jid || jid === 'status@broadcast') return;
     const chat = ensureChat(jid);
+    const previousTs = Number(chat.lastMessageTimestamp || chat.conversationTimestamp || 0);
+    const previousLastMessage = chat.lastMessage || '';
     const next = { ...input };
     delete next.conditional;
     Object.assign(chat, next);
+    const incomingTs = Number(input.lastMessageTimestamp || input.conversationTimestamp || 0);
+    if (previousTs > 0 && incomingTs > 0 && incomingTs < previousTs) {
+      chat.lastMessageTimestamp = previousTs;
+      chat.conversationTimestamp = Math.max(previousTs, Number(chat.conversationTimestamp || 0));
+      if (previousLastMessage) chat.lastMessage = previousLastMessage;
+    }
     if (typeof input.archived === 'boolean') chat.archived = input.archived;
-    if (typeof input.unreadCount === 'number') chat.unreadCount = input.unreadCount;
+    if (typeof input.unreadCount === 'number') chat.unreadCount = Math.max(0, input.unreadCount);
     touch();
   };
 
@@ -136,6 +234,22 @@ export function createCrmStore(dataDir) {
     const lid = state.contacts[mapping.lid];
     if (pn && !lid) state.contacts[mapping.lid] = { ...pn, id: mapping.lid, lid: mapping.lid, phoneNumber: mapping.pn };
     if (lid && !pn) state.contacts[mapping.pn] = { ...lid, id: mapping.pn, lid: mapping.lid, phoneNumber: mapping.pn };
+
+    const lidChat = state.chats[mapping.lid];
+    const pnChat = state.chats[mapping.pn];
+    if (lidChat || pnChat) {
+      const lidTs = Number(lidChat?.lastMessageTimestamp || lidChat?.conversationTimestamp || 0);
+      const pnTs = Number(pnChat?.lastMessageTimestamp || pnChat?.conversationTimestamp || 0);
+      const latest = lidTs > pnTs ? lidChat : pnChat;
+      state.chats[mapping.pn] = {
+        ...(lidChat || {}),
+        ...(pnChat || {}),
+        id: mapping.pn,
+        unreadCount: Math.max(Number(lidChat?.unreadCount || 0), Number(pnChat?.unreadCount || 0)),
+        lastMessageTimestamp: Math.max(lidTs, pnTs),
+        lastMessage: latest?.lastMessage || pnChat?.lastMessage || lidChat?.lastMessage || ''
+      };
+    }
     touch();
   };
 
@@ -172,6 +286,7 @@ export function createCrmStore(dataDir) {
       text: messageText(raw.message),
       type: messageType(raw.message),
       deleted: false,
+      media: mediaInfo(raw.message),
       location: loc && loc.degreesLatitude != null && loc.degreesLongitude != null ? {
         latitude: Number(loc.degreesLatitude),
         longitude: Number(loc.degreesLongitude),
@@ -190,10 +305,15 @@ export function createCrmStore(dataDir) {
     if (idx >= 0) arr[idx] = { ...arr[idx], ...item };
     else arr.push(item);
     arr.sort((a,b) => a.timestamp - b.timestamp);
-    if (arr.length > MAX_MESSAGES_PER_CHAT) arr.splice(0, arr.length - MAX_MESSAGES_PER_CHAT);
+    if (MAX_MESSAGES_PER_CHAT > 0 && arr.length > MAX_MESSAGES_PER_CHAT) {
+      arr.splice(0, arr.length - MAX_MESSAGES_PER_CHAT);
+    }
 
-    chat.lastMessageTimestamp = ts;
-    chat.lastMessage = item.text;
+    const previousLastTs = Number(chat.lastMessageTimestamp || chat.conversationTimestamp || 0);
+    if (ts >= previousLastTs) {
+      chat.lastMessageTimestamp = ts;
+      chat.lastMessage = item.text;
+    }
     if (raw.pushName && !chat.pushName) chat.pushName = raw.pushName;
     if (countUnread && idx < 0 && !item.fromMe) chat.unreadCount = Number(chat.unreadCount || 0) + 1;
     touch();
@@ -227,16 +347,49 @@ export function createCrmStore(dataDir) {
     for (const entry of updates || []) {
       const key = entry?.key;
       const update = entry?.update || {};
+      const jid = key?.remoteJid;
+      const id = key?.id;
+      if (!jid || !id) continue;
+      const arr = state.messages[jid] || [];
+      const item = arr.find(x => x.id === id);
+
       if (update.message === null && Number(update.messageStubType) === Number(WAMessageStubType.REVOKE)) {
-        const jid = key?.remoteJid;
-        const id = key?.id;
-        if (!jid || !id) continue;
-        const arr = state.messages[jid] || [];
-        const item = arr.find(x => x.id === id);
         if (item) {
           item.deleted = true;
           item.deletedAt = Date.now();
           item.deletedForEveryone = true;
+          changed = true;
+        }
+        continue;
+      }
+
+      if (item && update.message) {
+        const unwrapped = unwrapMessage(update.message);
+        const loc = unwrapped?.liveLocationMessage || unwrapped?.locationMessage || null;
+        if (loc && loc.degreesLatitude != null && loc.degreesLongitude != null) {
+          item.location = {
+            latitude: Number(loc.degreesLatitude),
+            longitude: Number(loc.degreesLongitude),
+            accuracy: loc.accuracyInMeters == null ? null : Number(loc.accuracyInMeters),
+            speed: loc.speedInMps == null ? null : Number(loc.speedInMps),
+            live: !!(unwrapped?.liveLocationMessage || loc.isLive),
+            sequenceNumber: numberValue(loc.sequenceNumber),
+            name: loc.name || null,
+            address: loc.address || null,
+            caption: loc.caption || loc.comment || null,
+            updatedAt: Date.now()
+          };
+          changed = true;
+        }
+        const media = mediaInfo(update.message);
+        if (media) {
+          item.media = { ...(item.media || {}), ...media };
+          changed = true;
+        }
+        const text = messageText(update.message);
+        if (text && text !== '[Mensagem]') {
+          item.text = text;
+          item.type = messageType(update.message);
           changed = true;
         }
       }
@@ -279,26 +432,62 @@ export function createCrmStore(dataDir) {
     touch();
   };
 
+  const canonicalJid = jid => {
+    const value = String(jid || '');
+    if (value.endsWith('@lid')) {
+      const mapped = state.lidMap[value];
+      if (mapped && String(mapped).endsWith('@s.whatsapp.net')) return String(mapped);
+    }
+    return value;
+  };
+
   const listChats = ({ archived = false, search = '', labelId = '' } = {}) => {
     const q = String(search || '').trim().toLowerCase();
-    return Object.values(state.chats)
+    const buckets = new Map();
+
+    for (const chat of Object.values(state.chats)) {
+      const id = canonicalJid(chat.id);
+      if (!id) continue;
+      const bucket = buckets.get(id) || [];
+      bucket.push(chat);
+      buckets.set(id, bucket);
+    }
+
+    return [...buckets.entries()]
+      .map(([id, members]) => {
+        const canonical = state.chats[id] || members
+          .slice()
+          .sort((a, b) =>
+            Number(b.lastMessageTimestamp || b.conversationTimestamp || 0) -
+            Number(a.lastMessageTimestamp || a.conversationTimestamp || 0)
+          )[0];
+        const latest = members
+          .slice()
+          .sort((a, b) =>
+            Number(b.lastMessageTimestamp || b.conversationTimestamp || 0) -
+            Number(a.lastMessageTimestamp || a.conversationTimestamp || 0)
+          )[0] || canonical;
+        const aliases = new Set(members.map(x => x.id));
+        aliases.add(id);
+        const labels = [...new Set([...aliases].flatMap(alias => state.chatLabels[alias] || []))];
+        const unreadCount = Math.max(0, ...members.map(x => Number(x.unreadCount || 0)));
+        const contact = contactFor(id);
+
+        return {
+          id,
+          name: chatName(id),
+          archived: !!canonical?.archived,
+          unreadCount,
+          lastMessage: latest?.lastMessage || '',
+          lastMessageTimestamp: Number(latest?.lastMessageTimestamp || latest?.conversationTimestamp || 0),
+          isGroup: id.endsWith('@g.us'),
+          labels,
+          avatar: contact?.imgUrl && contact.imgUrl !== 'changed' ? contact.imgUrl : null,
+          presence: state.presences[id] || [...aliases].map(alias => state.presences[alias]).find(Boolean) || null
+        };
+      })
       .filter(c => !!c.archived === !!archived)
-      .filter(c => !labelId || (state.chatLabels[c.id] || []).includes(labelId))
-      .map(c => ({
-        id: c.id,
-        name: chatName(c.id),
-        archived: !!c.archived,
-        unreadCount: Number(c.unreadCount || 0),
-        lastMessage: c.lastMessage || '',
-        lastMessageTimestamp: Number(c.lastMessageTimestamp || c.conversationTimestamp || 0),
-        isGroup: c.id.endsWith('@g.us'),
-        labels: state.chatLabels[c.id] || [],
-        avatar: (() => {
-          const contact = contactFor(c.id);
-          return contact?.imgUrl && contact.imgUrl !== 'changed' ? contact.imgUrl : null;
-        })(),
-        presence: state.presences[c.id] || null
-      }))
+      .filter(c => !labelId || c.labels.includes(labelId))
       .filter(c => !q || (c.name + ' ' + c.id + ' ' + c.lastMessage).toLowerCase().includes(q))
       .sort((a,b) => b.lastMessageTimestamp - a.lastMessageTimestamp);
   };
@@ -317,7 +506,7 @@ export function createCrmStore(dataDir) {
     return value;
   };
 
-  const getMessages = (jid, limit = 100) => {
+  const getMessages = (jid, options = {}) => {
     const alias = state.lidMap[jid];
     const ids = [...new Set([jid, alias].filter(Boolean))];
     const byId = new Map();
@@ -332,9 +521,23 @@ export function createCrmStore(dataDir) {
       }
     }
 
-    const arr = [...byId.values()].sort((a,b) => Number(a?.timestamp || 0) - Number(b?.timestamp || 0));
-    const safeLimit = Math.min(500, Math.max(1, Number(limit) || 100));
-    return arr.slice(Math.max(0, arr.length - safeLimit));
+    const all = [...byId.values()].sort((a,b) => Number(a?.timestamp || 0) - Number(b?.timestamp || 0));
+    const safeLimit = Math.min(500, Math.max(1, Number(options.limit || 100)));
+    const before = Math.max(0, Number(options.before || 0));
+    const offset = Math.max(0, Number(options.offset || 0));
+    const filtered = before > 0
+      ? all.filter(message => Number(message?.timestamp || 0) < before)
+      : all;
+    const end = Math.max(0, filtered.length - offset);
+    const start = Math.max(0, end - safeLimit);
+    const messages = filtered.slice(start, end);
+
+    return {
+      messages,
+      total: all.length,
+      hasMore: start > 0,
+      nextBefore: start > 0 && messages.length ? Number(messages[0]?.timestamp || 0) : null
+    };
   };
 
   const markReadLocal = jid => {
@@ -365,8 +568,8 @@ export function createCrmStore(dataDir) {
       hasMore: safeLimit > 0 ? safeOffset + chats.length < allChats.length : false,
       labels: includeMeta ? Object.values(state.labels).filter(x => !x.deleted) : [],
       groups: includeMeta ? Object.values(state.groups).sort((a,b) => String(a.subject).localeCompare(String(b.subject))) : [],
-      archivedCount: Object.values(state.chats).filter(c => !!c.archived).length,
-      unreadTotal: Object.values(state.chats).reduce((n,c) => n + Number(c.unreadCount || 0), 0)
+      archivedCount: listChats({ archived: true }).length,
+      unreadTotal: listChats({ archived: false }).reduce((n,c) => n + Number(c.unreadCount || 0), 0)
     };
   };
 

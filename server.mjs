@@ -8,6 +8,7 @@ import QRCode from 'qrcode';
 import pino from 'pino';
 import fs from 'node:fs';
 import { createCrmStore } from './crm-store.mjs';
+import { createAiEngine } from './ai-engine.mjs';
 
 const app = express();
 app.use(express.json({ limit: '24mb' }));
@@ -90,6 +91,28 @@ async function resolveOutboundJid(jid) {
   return CRM.resolveSendJid(value);
 }
 
+async function sendCrmText(jid, text) {
+  const value = String(jid || '');
+  const message = String(text || '').trim();
+  if (!value || !message) throw new Error('jid_and_text_required');
+  if (!sock || status !== 'open') throw new Error('whatsapp_not_connected');
+
+  const targetJid = await resolveOutboundJid(value);
+  if (value.endsWith('@lid') && targetJid === value) {
+    throw new Error('contact_number_still_syncing');
+  }
+
+  const sent = await sock.sendMessage(targetJid, { text: message });
+  if (sent) CRM.upsertMessage(sent);
+  return { ok: true, messageId: sent?.key?.id || null, resolved: targetJid !== value };
+}
+
+const AI = createAiEngine({
+  dataDir: DATA_DIR,
+  crm: CRM,
+  sendText: sendCrmText
+});
+
 async function stopSocket() {
   try {
     if (sock?.ws) sock.ws.close();
@@ -144,6 +167,14 @@ async function startSession(mode, phone = null) {
     });
 
     CRM.attach(sock);
+    sock.ev.on('messages.upsert', ({ messages, type }) => {
+      if (type !== 'notify') return;
+      for (const message of messages || []) {
+        AI.handleIncoming(message).catch(error => {
+          console.error('[ai] incoming handler failed', error?.message || error);
+        });
+      }
+    });
     sock.ev.on('creds.update', saveCreds);
     sock.ev.on('connection.update', async update => {
       if (update.connection) status = update.connection;
@@ -304,12 +335,13 @@ app.post('/connect/qr', secure, async (_req, res) => {
 
 
 app.get('/crm/snapshot', secure, (req, res) => {
-  const archived = String(req.query.archived || '') === '1';
+  const archived = ['1', 'true', 'yes'].includes(String(req.query.archived || '').toLowerCase());
   const search = String(req.query.search || '');
   const labelId = String(req.query.labelId || '');
   const limit = Math.min(500, Math.max(0, Number(req.query.limit || 0)));
   const offset = Math.max(0, Number(req.query.offset || 0));
-  const includeMeta = String(req.query.includeMeta ?? '1') !== '0';
+  const metaValue = req.query.includeMeta ?? req.query.meta ?? '1';
+  const includeMeta = !['0', 'false', 'no'].includes(String(metaValue).toLowerCase());
   res.json(CRM.snapshot({ archived, search, labelId, limit, offset, includeMeta }));
 });
 
@@ -317,7 +349,9 @@ app.get('/crm/messages', secure, (req, res) => {
   const jid = String(req.query.jid || '');
   if (!jid) return res.status(400).json({ error: 'missing_jid' });
   const limit = Math.min(500, Math.max(1, Number(req.query.limit || 120)));
-  res.json({ jid, messages: CRM.getMessages(jid, limit) });
+  const before = Math.max(0, Number(req.query.before || 0));
+  const offset = Math.max(0, Number(req.query.offset || 0));
+  res.json({ jid, ...CRM.getMessages(jid, { limit, before, offset }) });
 });
 
 app.get('/crm/avatar', secure, async (req, res) => {
@@ -337,24 +371,19 @@ app.post('/crm/send', secure, async (req, res) => {
   const jid = String(req.body?.jid || '');
   const text = String(req.body?.text || '').trim();
   if (!jid || !text) return res.status(400).json({ error: 'jid_and_text_required' });
-  if (!sock || status !== 'open') return res.status(409).json({ error: 'whatsapp_not_connected' });
 
   try {
-    const targetJid = await resolveOutboundJid(jid);
-    if (jid.endsWith('@lid') && targetJid === jid) {
-      return res.status(409).json({ error: 'contact_number_still_syncing' });
-    }
-    const sent = await sock.sendMessage(targetJid, { text });
-    if (sent) CRM.upsertMessage(sent);
-    res.json({ ok: true, messageId: sent?.key?.id || null, resolved: targetJid !== jid });
+    res.json(await sendCrmText(jid, text));
   } catch (error) {
+    const code = error?.message === 'whatsapp_not_connected' || error?.message === 'contact_number_still_syncing'
+      ? 409
+      : 502;
     console.error('[crm] send failed', {
       jid,
       message: error?.message || String(error)
     });
-    res.status(502).json({
-      error: 'whatsapp_send_failed',
-      detail: error?.message || String(error)
+    res.status(code).json({
+      error: error?.message || 'whatsapp_send_failed'
     });
   }
 });
@@ -428,7 +457,50 @@ app.post('/crm/resync', secure, async (_req, res) => {
   const collections = ['critical_unblock_low','regular_high','regular_low','critical_block','regular'];
   await sock.resyncAppState(collections, true);
   const groups = await CRM.syncGroups(sock).catch(() => 0);
-  res.json({ ok: true, groups });
+  const lids = await resolveStoredLids().catch(() => 0);
+  CRM.saveNow();
+  res.json({ ok: true, groups, lids });
+});
+
+app.get('/crm/ai/status', secure, (req, res) => {
+  const jid = String(req.query.jid || '') || null;
+  res.json(AI.status(jid));
+});
+
+app.post('/crm/ai/mode', secure, (req, res) => {
+  const mode = String(req.body?.mode || '');
+  const jid = String(req.body?.jid || '') || null;
+  try {
+    res.json({ ok: true, ...AI.setMode(mode, jid) });
+  } catch (error) {
+    res.status(400).json({ error: error?.message || 'invalid_ai_mode' });
+  }
+});
+
+app.get('/crm/ai/suggestions', secure, (req, res) => {
+  const jid = String(req.query.jid || '');
+  if (!jid) return res.status(400).json({ error: 'missing_jid' });
+  const limit = Math.max(1, Math.min(100, Number(req.query.limit || 20)));
+  res.json({ jid, suggestions: AI.listSuggestions(jid, limit) });
+});
+
+app.post('/crm/ai/suggestions/review', secure, (req, res) => {
+  const jid = String(req.body?.jid || '');
+  const id = String(req.body?.id || '');
+  const nextStatus = String(req.body?.status || '');
+  if (!jid || !id) return res.status(400).json({ error: 'jid_and_id_required' });
+  try {
+    res.json({ ok: true, suggestion: AI.reviewSuggestion(jid, id, nextStatus) });
+  } catch (error) {
+    const code = error?.message === 'suggestion_not_found' ? 404 : 400;
+    res.status(code).json({ error: error?.message || 'suggestion_review_failed' });
+  }
+});
+
+app.get('/crm/ai/audit', secure, (req, res) => {
+  const jid = String(req.query.jid || '') || null;
+  const limit = Math.max(1, Math.min(500, Number(req.query.limit || 100)));
+  res.json({ jid, audit: AI.listAudit(jid, limit) });
 });
 
 app.post('/connect/phone', secure, async (req, res) => {
@@ -528,7 +600,7 @@ async function clearProfessionalGroups(dryRun=false){
     const labels=(CRM.state.chatLabels[g.id]||[]).map(String);
     const protectedGroup=isClientGroup(g) || (protectedLabelId && labels.includes(String(protectedLabelId)));
     if(protectedGroup || !isProfessionalGroup(g)) continue;
-    const msgs=(CRM.getMessages(g.id,500)||[]).filter(m=>!m.deleted);
+    const msgs=(CRM.getMessages(g.id,{limit:500}).messages||[]).filter(m=>!m.deleted);
     if(!msgs.length){results.push({id:g.id,name:g.subject,cleared:0});continue;}
     if(!dryRun){
       const payload=msgs.map(m=>({id:m.id,fromMe:!!m.fromMe,timestamp:String(m.timestamp)}));
