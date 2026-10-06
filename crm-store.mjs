@@ -2,7 +2,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { WAMessageStubType } from 'baileys';
 
-const MAX_MESSAGES_PER_CHAT = 500;
+const configuredRetention = Number(process.env.CRM_MAX_MESSAGES_PER_CHAT || 0);
+const MAX_MESSAGES_PER_CHAT = Number.isFinite(configuredRetention) && configuredRetention > 0
+  ? Math.floor(configuredRetention)
+  : 0;
 
 const numberValue = value => {
   if (value == null) return 0;
@@ -18,6 +21,7 @@ const unwrapMessage = message => {
   if (message.ephemeralMessage?.message) return unwrapMessage(message.ephemeralMessage.message);
   if (message.viewOnceMessage?.message) return unwrapMessage(message.viewOnceMessage.message);
   if (message.viewOnceMessageV2?.message) return unwrapMessage(message.viewOnceMessageV2.message);
+  if (message.viewOnceMessageV2Extension?.message) return unwrapMessage(message.viewOnceMessageV2Extension.message);
   return message;
 };
 
@@ -27,7 +31,8 @@ const messageText = message => {
   if (m.conversation) return m.conversation;
   if (m.extendedTextMessage?.text) return m.extendedTextMessage.text;
   if (m.imageMessage) return m.imageMessage.caption || '📷 Imagem';
-  if (m.videoMessage) return m.videoMessage.caption || '🎥 Vídeo';  if (m.audioMessage) return '🎵 Áudio';
+  if (m.videoMessage) return m.videoMessage.caption || '🎥 Vídeo';
+  if (m.audioMessage) return '🎵 Áudio';
   if (m.documentMessage) return '📄 ' + (m.documentMessage.fileName || 'Documento');
   if (m.stickerMessage) return '🖼️ Figurinha';
   if (m.contactMessage) return '👤 Contato';
@@ -50,17 +55,99 @@ const safeNameFromJid = jid => {
   return jid.split('@')[0]?.replace(/\D/g, '') || jid;
 };
 
+const asBuffer = value => {
+  if (!value) return null;
+  if (Buffer.isBuffer(value)) return value;
+  if (value?.type === 'Buffer' && Array.isArray(value.data)) return Buffer.from(value.data);
+  if (value instanceof Uint8Array) return Buffer.from(value);
+  return null;
+};
+
+const thumbnailDataUrl = (value, mimetype = 'image/jpeg') => {
+  const buffer = asBuffer(value);
+  if (!buffer || buffer.length === 0 || buffer.length > 256 * 1024) return null;
+  return 'data:' + mimetype + ';base64,' + buffer.toString('base64');
+};
+
+const mediaInfo = message => {
+  const m = unwrapMessage(message);
+  if (!m) return null;
+
+  let kind = null;
+  let value = null;
+  if (m.imageMessage) { kind = 'image'; value = m.imageMessage; }
+  else if (m.videoMessage) { kind = 'video'; value = m.videoMessage; }
+  else if (m.audioMessage) { kind = 'audio'; value = m.audioMessage; }
+  else if (m.documentMessage) { kind = 'document'; value = m.documentMessage; }
+  else if (m.stickerMessage) { kind = 'sticker'; value = m.stickerMessage; }
+  if (!kind || !value) return null;
+
+  return {
+    kind,
+    mimetype: value.mimetype || null,
+    fileName: value.fileName || value.title || null,
+    caption: value.caption || null,
+    seconds: numberValue(value.seconds) || null,
+    width: numberValue(value.width) || null,
+    height: numberValue(value.height) || null,
+    fileLength: numberValue(value.fileLength) || null,
+    ptt: !!value.ptt,
+    animated: !!value.isAnimated,
+    thumbnail: thumbnailDataUrl(value.jpegThumbnail, 'image/jpeg')
+  };
+};
+
+const locationInfo = message => {
+  const m = unwrapMessage(message);
+  if (!m) return null;
+  const loc = m.liveLocationMessage || m.locationMessage || null;
+  if (!loc || loc.degreesLatitude == null || loc.degreesLongitude == null) return null;
+  return {
+    latitude: Number(loc.degreesLatitude),
+    longitude: Number(loc.degreesLongitude),
+    accuracy: loc.accuracyInMeters == null ? null : Number(loc.accuracyInMeters),
+    speed: loc.speedInMps == null ? null : Number(loc.speedInMps),
+    live: !!(m.liveLocationMessage || loc.isLive),
+    sequenceNumber: numberValue(loc.sequenceNumber),
+    name: loc.name || null,
+    address: loc.address || null,
+    caption: loc.caption || loc.comment || null
+  };
+};
+
 export function createCrmStore(dataDir) {
   const file = path.join(path.dirname(dataDir), 'crm-state.json');
   let state = {
-    version: 1, rev: 0, updatedAt: Date.now(),
-    chats: {}, messages: {}, contacts: {}, groups: {},
-    labels: {}, chatLabels: {}, lidMap: {}, presences: {}
+    version: 2,
+    rev: 0,
+    updatedAt: Date.now(),
+    chats: {},
+    messages: {},
+    contacts: {},
+    groups: {},
+    labels: {},
+    chatLabels: {},
+    lidMap: {},
+    presences: {}
   };
-  let saveTimer = null;  try {
+  let saveTimer = null;
+
+  try {
     if (fs.existsSync(file)) {
       const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
-      state = { ...state, ...parsed };
+      state = {
+        ...state,
+        ...parsed,
+        version: 2,
+        chats: parsed.chats || {},
+        messages: parsed.messages || {},
+        contacts: parsed.contacts || {},
+        groups: parsed.groups || {},
+        labels: parsed.labels || {},
+        chatLabels: parsed.chatLabels || {},
+        lidMap: parsed.lidMap || {},
+        presences: parsed.presences || {}
+      };
     }
   } catch (error) {
     console.error('[crm] failed to load state', error?.message || error);
@@ -83,9 +170,17 @@ export function createCrmStore(dataDir) {
     saveTimer = setTimeout(saveNow, 250);
   };
 
+  const aliasFor = jid => state.lidMap[jid] || null;
+
   const contactFor = jid => {
-    const mapped = state.lidMap[jid];
-    return state.contacts[jid] || (mapped ? state.contacts[mapped] : null) || {};
+    const direct = state.contacts[jid] || {};
+    const alias = aliasFor(jid);
+    const mapped = alias ? (state.contacts[alias] || {}) : {};
+
+    if (String(jid || '').endsWith('@lid') && String(alias || '').endsWith('@s.whatsapp.net')) {
+      return { ...direct, ...mapped, id: jid };
+    }
+    return { ...mapped, ...direct, id: jid };
   };
 
   const chatName = jid => {
@@ -100,16 +195,59 @@ export function createCrmStore(dataDir) {
     if (!jid || jid === 'status@broadcast') return null;
     state.chats[jid] ||= { id: jid, archived: false, unreadCount: 0 };
     return state.chats[jid];
-  };  const upsertChat = input => {
+  };
+
+  const upsertChat = (input, { historical = false } = {}) => {
     const jid = input?.id;
     if (!jid || jid === 'status@broadcast') return;
+    const existed = !!state.chats[jid];
     const chat = ensureChat(jid);
+    const previousTimestamp = numberValue(chat.lastMessageTimestamp || chat.conversationTimestamp);
+    const incomingTimestamp = numberValue(input.lastMessageTimestamp || input.conversationTimestamp);
+
     const next = { ...input };
     delete next.conditional;
+    delete next.lastMessageTimestamp;
+    delete next.conversationTimestamp;
+    delete next.lastMessage;
+    delete next.unreadCount;
+    delete next.archived;
     Object.assign(chat, next);
-    if (typeof input.archived === 'boolean') chat.archived = input.archived;
-    if (typeof input.unreadCount === 'number') chat.unreadCount = input.unreadCount;
+
+    if (!historical || !existed) {
+      if (typeof input.archived === 'boolean') chat.archived = input.archived;
+      if (typeof input.unreadCount === 'number') chat.unreadCount = input.unreadCount;
+    }
+
+    const effectiveTimestamp = Math.max(previousTimestamp, incomingTimestamp);
+    if (effectiveTimestamp > 0) {
+      chat.lastMessageTimestamp = effectiveTimestamp;
+      chat.conversationTimestamp = effectiveTimestamp;
+    }
+    if (incomingTimestamp >= previousTimestamp && input.lastMessage != null) {
+      chat.lastMessage = input.lastMessage;
+    }
     touch();
+  };
+
+  const mergeMappedContacts = (pnJid, lidJid) => {
+    const pn = state.contacts[pnJid] || {};
+    const lid = state.contacts[lidJid] || {};
+    const preferred = { ...lid, ...pn };
+
+    state.contacts[pnJid] = {
+      ...preferred,
+      id: pnJid,
+      lid: lidJid,
+      phoneNumber: pnJid
+    };
+    state.contacts[lidJid] = {
+      ...lid,
+      ...pn,
+      id: lidJid,
+      lid: lidJid,
+      phoneNumber: pnJid
+    };
   };
 
   const upsertContact = input => {
@@ -117,13 +255,17 @@ export function createCrmStore(dataDir) {
     if (!jid) return;
     const merged = { ...(state.contacts[jid] || {}), ...input };
     state.contacts[jid] = merged;
-    if (input.lid) {
-      state.contacts[input.lid] = { ...(state.contacts[input.lid] || {}), ...merged, id: input.lid };
+
+    if (input.lid && input.phoneNumber) {
+      state.lidMap[input.lid] = input.phoneNumber;
+      state.lidMap[input.phoneNumber] = input.lid;
+      mergeMappedContacts(input.phoneNumber, input.lid);
+    } else if (input.lid) {
       state.lidMap[input.lid] = input.phoneNumber || jid;
-    }
-    if (input.phoneNumber) {
-      state.contacts[input.phoneNumber] = { ...(state.contacts[input.phoneNumber] || {}), ...merged, id: input.phoneNumber };
+      if (input.phoneNumber) state.lidMap[input.phoneNumber] = input.lid;
+    } else if (input.phoneNumber) {
       state.lidMap[input.phoneNumber] = input.lid || jid;
+      if (input.lid) state.lidMap[input.lid] = input.phoneNumber;
     }
     touch();
   };
@@ -132,10 +274,7 @@ export function createCrmStore(dataDir) {
     if (!mapping?.pn || !mapping?.lid) return;
     state.lidMap[mapping.lid] = mapping.pn;
     state.lidMap[mapping.pn] = mapping.lid;
-    const pn = state.contacts[mapping.pn];
-    const lid = state.contacts[mapping.lid];
-    if (pn && !lid) state.contacts[mapping.lid] = { ...pn, id: mapping.lid, lid: mapping.lid, phoneNumber: mapping.pn };
-    if (lid && !pn) state.contacts[mapping.pn] = { ...lid, id: mapping.pn, lid: mapping.lid, phoneNumber: mapping.pn };
+    mergeMappedContacts(mapping.pn, mapping.lid);
     touch();
   };
 
@@ -159,9 +298,11 @@ export function createCrmStore(dataDir) {
     if (!jid || jid === 'status@broadcast') return;
     const id = raw?.key?.id;
     if (!id) return;
+
     const chat = ensureChat(jid);
-    const ts = numberValue(raw.messageTimestamp) || Math.floor(Date.now() / 1000);    const unwrapped = unwrapMessage(raw.message);
-    const loc = unwrapped?.liveLocationMessage || unwrapped?.locationMessage || null;
+    const ts = numberValue(raw.messageTimestamp) || Math.floor(Date.now() / 1000);
+    const location = locationInfo(raw.message);
+    const media = mediaInfo(raw.message);
     const item = {
       id,
       jid,
@@ -172,37 +313,51 @@ export function createCrmStore(dataDir) {
       text: messageText(raw.message),
       type: messageType(raw.message),
       deleted: false,
-      location: loc && loc.degreesLatitude != null && loc.degreesLongitude != null ? {
-        latitude: Number(loc.degreesLatitude),
-        longitude: Number(loc.degreesLongitude),
-        accuracy: loc.accuracyInMeters == null ? null : Number(loc.accuracyInMeters),
-        speed: loc.speedInMps == null ? null : Number(loc.speedInMps),
-        live: !!(unwrapped?.liveLocationMessage || loc.isLive),
-        sequenceNumber: numberValue(loc.sequenceNumber),
-        name: loc.name || null,
-        address: loc.address || null,
-        caption: loc.caption || loc.comment || null
-      } : null
+      location,
+      media
     };
 
     const arr = state.messages[jid] ||= [];
     const idx = arr.findIndex(x => x.id === id);
-    if (idx >= 0) arr[idx] = { ...arr[idx], ...item };
-    else arr.push(item);
-    arr.sort((a,b) => a.timestamp - b.timestamp);
-    if (arr.length > MAX_MESSAGES_PER_CHAT) arr.splice(0, arr.length - MAX_MESSAGES_PER_CHAT);
+    const previous = idx >= 0 ? arr[idx] : null;
 
-    chat.lastMessageTimestamp = ts;
-    chat.lastMessage = item.text;
+    if (previous) {
+      arr[idx] = {
+        ...previous,
+        ...item,
+        deleted: !!previous.deleted,
+        deletedAt: previous.deletedAt || null,
+        deletedForEveryone: !!previous.deletedForEveryone,
+        location: location || previous.location || null,
+        media: media || previous.media || null
+      };
+    } else {
+      arr.push(item);
+    }
+
+    arr.sort((a, b) => a.timestamp - b.timestamp);
+    if (MAX_MESSAGES_PER_CHAT > 0 && arr.length > MAX_MESSAGES_PER_CHAT) {
+      arr.splice(0, arr.length - MAX_MESSAGES_PER_CHAT);
+    }
+
+    const previousLast = numberValue(chat.lastMessageTimestamp || chat.conversationTimestamp);
+    if (ts >= previousLast) {
+      chat.lastMessageTimestamp = ts;
+      chat.conversationTimestamp = ts;
+      chat.lastMessage = item.text;
+    }
     if (raw.pushName && !chat.pushName) chat.pushName = raw.pushName;
-    if (countUnread && idx < 0 && !item.fromMe) chat.unreadCount = Number(chat.unreadCount || 0) + 1;
+    if (countUnread && idx < 0 && !item.fromMe) {
+      chat.unreadCount = Number(chat.unreadCount || 0) + 1;
+    }
     touch();
   };
 
   const mergeHistory = payload => {
     for (const map of payload?.lidPnMappings || []) upsertLidMapping(map);
     for (const c of payload?.contacts || []) upsertContact(c);
-    for (const c of payload?.chats || []) upsertChat(c);
+    for (const g of payload?.groups || []) upsertGroup(g);
+    for (const c of payload?.chats || []) upsertChat(c, { historical: true });
     for (const m of payload?.messages || []) upsertMessage(m, { countUnread: false });
   };
 
@@ -212,11 +367,13 @@ export function createCrmStore(dataDir) {
       const jid = key?.remoteJid;
       const id = key?.id;
       if (!jid || !id) continue;
-      const arr = state.messages[jid] || [];
-      const item = arr.find(x => x.id === id);
-      if (item) {
-        item.deleted = true;
-        item.deletedAt = Date.now();
+      for (const bucket of [jid, aliasFor(jid)].filter(Boolean)) {
+        const arr = state.messages[bucket] || [];
+        const item = arr.find(x => x.id === id);
+        if (item) {
+          item.deleted = true;
+          item.deletedAt = Date.now();
+        }
       }
     }
     touch();
@@ -224,23 +381,65 @@ export function createCrmStore(dataDir) {
 
   const handleMessageUpdates = updates => {
     let changed = false;
+
     for (const entry of updates || []) {
       const key = entry?.key;
       const update = entry?.update || {};
+      const jid = key?.remoteJid;
+      const id = key?.id;
+      if (!jid || !id) continue;
+
+      const buckets = [...new Set([jid, aliasFor(jid)].filter(Boolean))];
+      const items = [];
+      for (const bucket of buckets) {
+        const found = (state.messages[bucket] || []).find(x => x.id === id);
+        if (found) items.push(found);
+      }
+
       if (update.message === null && Number(update.messageStubType) === Number(WAMessageStubType.REVOKE)) {
-        const jid = key?.remoteJid;
-        const id = key?.id;
-        if (!jid || !id) continue;
-        const arr = state.messages[jid] || [];
-        const item = arr.find(x => x.id === id);
-        if (item) {
+        for (const item of items) {
           item.deleted = true;
           item.deletedAt = Date.now();
           item.deletedForEveryone = true;
           changed = true;
         }
+        continue;
+      }
+
+      if (update.message) {
+        const location = locationInfo(update.message);
+        const media = mediaInfo(update.message);
+        const text = messageText(update.message);
+        const type = messageType(update.message);
+
+        for (const item of items) {
+          if (location) {
+            const previousSequence = numberValue(item.location?.sequenceNumber);
+            const nextSequence = numberValue(location.sequenceNumber);
+            if (!previousSequence || !nextSequence || nextSequence >= previousSequence) {
+              item.location = { ...(item.location || {}), ...location };
+              item.text = location.live ? '📍 Localização ao vivo' : '📍 Localização';
+              item.type = type;
+              changed = true;
+            }
+          }
+          if (media) {
+            item.media = { ...(item.media || {}), ...media };
+            if (text && text !== '[Mensagem]') item.text = text;
+            item.type = type;
+            changed = true;
+          }
+        }
+      }
+
+      if (update.status != null) {
+        for (const item of items) {
+          item.status = Number(update.status);
+          changed = true;
+        }
       }
     }
+
     if (changed) touch();
   };
 
@@ -272,7 +471,8 @@ export function createCrmStore(dataDir) {
   const labelAssociation = ({ association, type }) => {
     const chatId = association?.chatId;
     const labelId = association?.labelId;
-    if (!chatId || !labelId) return;    const labels = new Set(state.chatLabels[chatId] || []);
+    if (!chatId || !labelId) return;
+    const labels = new Set(state.chatLabels[chatId] || []);
     if (type === 'remove') labels.delete(labelId);
     else labels.add(labelId);
     state.chatLabels[chatId] = [...labels];
@@ -300,7 +500,7 @@ export function createCrmStore(dataDir) {
         presence: state.presences[c.id] || null
       }))
       .filter(c => !q || (c.name + ' ' + c.id + ' ' + c.lastMessage).toLowerCase().includes(q))
-      .sort((a,b) => b.lastMessageTimestamp - a.lastMessageTimestamp);
+      .sort((a, b) => b.lastMessageTimestamp - a.lastMessageTimestamp);
   };
 
   const resolveSendJid = jid => {
@@ -317,13 +517,13 @@ export function createCrmStore(dataDir) {
     return value;
   };
 
-  const getMessages = (jid, limit = 100) => {
-    const alias = state.lidMap[jid];
+  const mergedMessages = jid => {
+    const alias = aliasFor(jid);
     const ids = [...new Set([jid, alias].filter(Boolean))];
     const byId = new Map();
 
-    for (const id of ids) {
-      for (const message of state.messages[id] || []) {
+    for (const bucket of ids) {
+      for (const message of state.messages[bucket] || []) {
         const key = String(message?.id || '') + '|' + String(message?.fromMe ? 1 : 0);
         const current = byId.get(key);
         if (!current || Number(message?.timestamp || 0) >= Number(current?.timestamp || 0)) {
@@ -332,13 +532,34 @@ export function createCrmStore(dataDir) {
       }
     }
 
-    const arr = [...byId.values()].sort((a,b) => Number(a?.timestamp || 0) - Number(b?.timestamp || 0));
-    const safeLimit = Math.min(500, Math.max(1, Number(limit) || 100));
-    return arr.slice(Math.max(0, arr.length - safeLimit));
+    return [...byId.values()].sort((a, b) => Number(a?.timestamp || 0) - Number(b?.timestamp || 0));
   };
 
+  const getMessagesPage = (jid, { limit = 120, before = 0, offset = 0 } = {}) => {
+    const safeLimit = Math.min(500, Math.max(1, Number(limit) || 120));
+    const safeOffset = Math.max(0, Number(offset) || 0);
+    const beforeTs = Math.max(0, Number(before) || 0);
+
+    let all = mergedMessages(jid);
+    if (beforeTs > 0) all = all.filter(m => Number(m?.timestamp || 0) < beforeTs);
+
+    const end = Math.max(0, all.length - safeOffset);
+    const start = Math.max(0, end - safeLimit);
+    const messages = all.slice(start, end);
+
+    return {
+      jid,
+      messages,
+      total: all.length,
+      hasMore: start > 0,
+      nextBefore: start > 0 && messages.length ? Number(messages[0]?.timestamp || 0) : null
+    };
+  };
+
+  const getMessages = (jid, limit = 100) => getMessagesPage(jid, { limit }).messages;
+
   const markReadLocal = jid => {
-    const ids = [...new Set([jid, state.lidMap[jid]].filter(Boolean))];
+    const ids = [...new Set([jid, aliasFor(jid)].filter(Boolean))];
     let changed = false;
     for (const id of ids) {
       const chat = ensureChat(id);
@@ -364,16 +585,16 @@ export function createCrmStore(dataDir) {
       totalChats: allChats.length,
       hasMore: safeLimit > 0 ? safeOffset + chats.length < allChats.length : false,
       labels: includeMeta ? Object.values(state.labels).filter(x => !x.deleted) : [],
-      groups: includeMeta ? Object.values(state.groups).sort((a,b) => String(a.subject).localeCompare(String(b.subject))) : [],
+      groups: includeMeta ? Object.values(state.groups).sort((a, b) => String(a.subject).localeCompare(String(b.subject))) : [],
       archivedCount: Object.values(state.chats).filter(c => !!c.archived).length,
-      unreadTotal: Object.values(state.chats).reduce((n,c) => n + Number(c.unreadCount || 0), 0)
+      unreadTotal: Object.values(state.chats).reduce((n, c) => n + Number(c.unreadCount || 0), 0)
     };
   };
 
   const attach = sock => {
     sock.ev.on('messaging-history.set', mergeHistory);
-    sock.ev.on('chats.upsert', chats => chats.forEach(upsertChat));
-    sock.ev.on('chats.update', chats => chats.forEach(upsertChat));
+    sock.ev.on('chats.upsert', chats => chats.forEach(c => upsertChat(c)));
+    sock.ev.on('chats.update', chats => chats.forEach(c => upsertChat(c)));
     sock.ev.on('contacts.upsert', contacts => contacts.forEach(upsertContact));
     sock.ev.on('contacts.update', contacts => contacts.forEach(upsertContact));
     sock.ev.on('lid-mapping.update', upsertLidMapping);
@@ -403,9 +624,11 @@ export function createCrmStore(dataDir) {
     upsertContact,
     upsertLidMapping,
     upsertPresence,
+    handleMessageUpdates,
     snapshot,
     resolveSendJid,
     getMessages,
+    getMessagesPage,
     markReadLocal,
     saveNow
   };
