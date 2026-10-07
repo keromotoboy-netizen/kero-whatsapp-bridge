@@ -1,0 +1,46 @@
+name: Action Pin Policy
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - ".github/workflows/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  enforce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Reject mutable third-party Action references
+        shell: python
+        run: |
+          from pathlib import Path
+          import re, sys
+          bad=[]
+          for path in Path(".github/workflows").glob("*.y*ml"):
+              for n,line in enumerate(path.read_text(encoding="utf-8").splitlines(),1):
+                  m=re.search(r"^\s*(?:-\s*)?uses:\s*([^\s#]+)",line)
+                  if not m:
+                      continue
+                  ref=m.group(1).strip("'\"")
+                  if ref.startswith("./"):
+                      continue
+                  if ref.startswith("docker://"):
+                      if "@sha256:" not in ref:
+                          bad.append((str(path),n,ref,"docker image must use sha256 digest"))
+                      continue
+                  if "@" not in ref or not re.fullmatch(r"[0-9a-fA-F]{40}",ref.rsplit("@",1)[1]):
+                      bad.append((str(path),n,ref,"Action must be pinned to a full 40-char commit SHA"))
+          if bad:
+              for row in bad:
+                  print(f"::error file={row[0]},line={row[1]}::{row[2]} - {row[3]}")
+              sys.exit(1)
+          print("All third-party Actions are immutably pinned.")
