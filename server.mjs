@@ -9,6 +9,8 @@ import pino from 'pino';
 import fs from 'node:fs';
 import { createCrmStore } from './crm-store.mjs';
 import { createAiEngine } from './ai-engine.mjs';
+import { assertFreshPairingSafe } from './pairing-safety.mjs';
+import { maintenanceMutationAllowed, scheduledMaintenanceAllowed } from './maintenance-permissions.mjs';
 
 const app = express();
 app.use(express.json({ limit: '24mb' }));
@@ -138,12 +140,10 @@ async function startSession(mode, phone = null) {
   startLock = (async () => {
     const freshPairing = mode === 'qr' || mode === 'phone';
     if (freshPairing && status === 'open') return publicState();
+    // Refuse a new QR/phone pairing when any saved auth or CRM data exists.
+    // The production session must never be erased by a UI pairing action.
+    if (freshPairing) assertFreshPairingSafe(fs.readdirSync(DATA_DIR));
     await stopSocket();
-    if (freshPairing) {
-      fs.rmSync(DATA_DIR, { recursive: true, force: true });
-      fs.mkdirSync(DATA_DIR, { recursive: true });
-      console.log('[wa] cleared stale auth before fresh pairing');
-    }
     status = 'starting';
     latestQr = null;
     latestQrDataUrl = null;
@@ -159,7 +159,7 @@ async function startSession(mode, phone = null) {
     sock = makeWASocket({
       auth: state,
       version,
-      logger: pino({ level: 'warn' }),
+      logger: pino({ level: 'silent' }), // Guard: Baileys can log Signal session key material at WARN
       browser: ['Kero CRM', 'Chrome', '1.0.0'],
       markOnlineOnConnect: false,
       syncFullHistory: true,
@@ -612,6 +612,7 @@ async function clearProfessionalGroups(dryRun=false){
   return results;
 }
 async function runKeroMaintenance({dryRun=false}={}){
+  if(!dryRun && !maintenanceMutationAllowed(process.env)) throw new Error('maintenance_mutation_disabled');
   if(!sock || status!=='open') throw new Error('whatsapp_not_connected');
   const clientLabel=await ensureClientGroupLabel(dryRun);
   const tempLabels=await removeTemporaryLabels(dryRun);
@@ -629,7 +630,7 @@ setInterval(async ()=>{
   try{
     const parts=Object.fromEntries(new Intl.DateTimeFormat('en-CA',{timeZone:'America/Sao_Paulo',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(new Date()).filter(x=>x.type!=='literal').map(x=>[x.type,x.value]));
     const date=parts.year+'-'+parts.month+'-'+parts.day;
-    if(parts.hour==='00' && Number(parts.minute)<10 && maintenanceState.lastDate!==date && status==='open'){
+    if(scheduledMaintenanceAllowed(process.env) && parts.hour==='00' && Number(parts.minute)<10 && maintenanceState.lastDate!==date && status==='open'){
       const result=await runKeroMaintenance({dryRun:false});
       maintenanceState.lastDate=date;maintenanceState.lastResult=result;saveMaintenance();
       console.log('[maintenance] midnight completed', {date,temp:result.tempLabelsRemoved,groups:result.professionalGroups.length,messages:result.totalMessages});
