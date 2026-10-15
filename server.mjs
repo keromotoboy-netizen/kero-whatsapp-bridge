@@ -9,6 +9,7 @@ import pino from 'pino';
 import fs from 'node:fs';
 import { createCrmStore } from './crm-store.mjs';
 import { createAiEngine } from './ai-engine.mjs';
+import { assertFreshPairingSafe } from './pairing-safety.mjs';
 
 const app = express();
 app.use(express.json({ limit: '24mb' }));
@@ -138,12 +139,10 @@ async function startSession(mode, phone = null) {
   startLock = (async () => {
     const freshPairing = mode === 'qr' || mode === 'phone';
     if (freshPairing && status === 'open') return publicState();
+    // Refuse a new QR/phone pairing when any saved auth or CRM data exists.
+    // The production session must never be erased by a UI pairing action.
+    if (freshPairing) assertFreshPairingSafe(fs.readdirSync(DATA_DIR));
     await stopSocket();
-    if (freshPairing) {
-      fs.rmSync(DATA_DIR, { recursive: true, force: true });
-      fs.mkdirSync(DATA_DIR, { recursive: true });
-      console.log('[wa] cleared stale auth before fresh pairing');
-    }
     status = 'starting';
     latestQr = null;
     latestQrDataUrl = null;
