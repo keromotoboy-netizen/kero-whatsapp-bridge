@@ -62,3 +62,29 @@ test('receipt for unknown id does not create synthetic message', () => {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('receipt status is persisted across a CRM store reload', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crm-ack-persist-'));
+  try {
+    const auth = path.join(root, 'auth');
+    fs.mkdirSync(auth, { recursive: true });
+    const jid = '5511900000000@s.whatsapp.net';
+    const store = createCrmStore(auth);
+    store.upsertMessage({
+      key: { id: 'ack-stored', remoteJid: jid, fromMe: true },
+      messageTimestamp: 100,
+      message: { conversation: 'Fixture de homologação' }
+    });
+    const ev = new EventEmitter();
+    store.attach({ ev });
+    ev.emit('messages.update', [{
+      key: { id: 'ack-stored', remoteJid: jid, fromMe: true },
+      update: { status: 2 }
+    }]);
+    store.saveNow();
+    const recovered = createCrmStore(auth);
+    assert.equal(recovered.getMessages(jid, { limit: 5 }).messages[0].deliveryStatus, 2);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
