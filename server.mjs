@@ -159,7 +159,7 @@ async function startSession(mode, phone = null) {
     sock = makeWASocket({
       auth: state,
       version,
-      logger: pino({ level: 'warn' }),
+      logger: pino({ level: 'silent' }), // Guard: Baileys can log Signal session key material at WARN
       browser: ['Kero CRM', 'Chrome', '1.0.0'],
       markOnlineOnConnect: false,
       syncFullHistory: true,
