@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import { createCrmStore } from './crm-store.mjs';
 import { createAiEngine } from './ai-engine.mjs';
 import { assertFreshPairingSafe } from './pairing-safety.mjs';
+import { maintenanceMutationAllowed, scheduledMaintenanceAllowed } from './maintenance-permissions.mjs';
 
 const app = express();
 app.use(express.json({ limit: '24mb' }));
@@ -611,6 +612,7 @@ async function clearProfessionalGroups(dryRun=false){
   return results;
 }
 async function runKeroMaintenance({dryRun=false}={}){
+  if(!dryRun && !maintenanceMutationAllowed(process.env)) throw new Error('maintenance_mutation_disabled');
   if(!sock || status!=='open') throw new Error('whatsapp_not_connected');
   const clientLabel=await ensureClientGroupLabel(dryRun);
   const tempLabels=await removeTemporaryLabels(dryRun);
@@ -628,7 +630,7 @@ setInterval(async ()=>{
   try{
     const parts=Object.fromEntries(new Intl.DateTimeFormat('en-CA',{timeZone:'America/Sao_Paulo',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(new Date()).filter(x=>x.type!=='literal').map(x=>[x.type,x.value]));
     const date=parts.year+'-'+parts.month+'-'+parts.day;
-    if(parts.hour==='00' && Number(parts.minute)<10 && maintenanceState.lastDate!==date && status==='open'){
+    if(scheduledMaintenanceAllowed(process.env) && parts.hour==='00' && Number(parts.minute)<10 && maintenanceState.lastDate!==date && status==='open'){
       const result=await runKeroMaintenance({dryRun:false});
       maintenanceState.lastDate=date;maintenanceState.lastResult=result;saveMaintenance();
       console.log('[maintenance] midnight completed', {date,temp:result.tempLabelsRemoved,groups:result.professionalGroups.length,messages:result.totalMessages});
