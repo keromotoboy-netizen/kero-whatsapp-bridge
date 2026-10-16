@@ -353,6 +353,16 @@ export function createCrmStore(dataDir) {
       const arr = state.messages[jid] || [];
       const item = arr.find(x => x.id === id);
 
+      // WhatsApp can report SERVER_ACK(1), DELIVERY_ACK(2), READ(3), PLAYED(4)
+      // asynchronously. Only store monotonic numeric status; never log message data.
+      if (item && Number.isInteger(update.status) && update.status >= 0 && update.status <= 4) {
+        const previous = Number.isInteger(item.deliveryStatus) ? item.deliveryStatus : -1;
+        if (update.status > previous) {
+          item.deliveryStatus = update.status;
+          changed = true;
+        }
+      }
+
       if (update.message === null && Number(update.messageStubType) === Number(WAMessageStubType.REVOKE)) {
         if (item) {
           item.deleted = true;
