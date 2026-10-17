@@ -541,7 +541,9 @@ async function runKeroMaintenance({dryRun=false}={}){
   // Opt-in only: never clear messages or mutate labels by accident.
   if (!dryRun && process.env.CRM_ALLOW_DESTRUCTIVE_MAINTENANCE !== '1') throw new Error('destructive_maintenance_disabled');
   if(!sock || status!=='open') throw new Error('whatsapp_not_connected');
-  const clientLabel=await ensureClientGroupLabel(dryRun);
+  // CEO midnight scope is limited to two temporary labels and archived-group message history.
+  // Permanent client-group labeling remains a separate administrative action.
+  const clientLabel={skipped:true,reason:'not_part_of_midnight_policy'};
   const tempLabels=await removeTemporaryLabels(dryRun);
   const groups=await clearArchivedGroups(dryRun);
   const result={dryRun,at:new Date().toISOString(),clientLabel,tempLabelsRemoved:tempLabels.length,archivedGroups:groups,totalMessages:groups.reduce((n,x)=>n+x.cleared,0)};
