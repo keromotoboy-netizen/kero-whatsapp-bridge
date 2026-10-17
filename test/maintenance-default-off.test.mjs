@@ -9,7 +9,7 @@ test('source has exactly one explicit guard before any mutation', () => {
   assert.ok(manual, 'manual mutating maintenance must be guarded');
   const functionStart = source.indexOf('async function runKeroMaintenance');
   assert.ok(functionStart >= 0);
-  assert.ok(source.indexOf('destructive_maintenance_disabled', functionStart) < source.indexOf('ensureClientGroupLabel(dryRun)', functionStart));
+  assert.ok(source.indexOf('destructive_maintenance_disabled', functionStart) < source.indexOf('await removeTemporaryLabels(dryRun)', functionStart));
 });
 test('manual maintenance is off by default; dry run remains available', () => {
   assert.ok(manual);
