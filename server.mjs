@@ -9,6 +9,8 @@ import pino from 'pino';
 import fs from 'node:fs';
 import { createCrmStore } from './crm-store.mjs';
 import { createAiEngine } from './ai-engine.mjs';
+import { assertFreshPairingSafe } from './pairing-safety.mjs';
+import { maintenanceMutationAllowed, scheduledMaintenanceAllowed } from './maintenance-permissions.mjs';
 
 const app = express();
 app.use(express.json({ limit: '24mb' }));
@@ -138,12 +140,10 @@ async function startSession(mode, phone = null) {
   startLock = (async () => {
     const freshPairing = mode === 'qr' || mode === 'phone';
     if (freshPairing && status === 'open') return publicState();
+    // Refuse a new QR/phone pairing when any saved auth or CRM data exists.
+    // The production session must never be erased by a UI pairing action.
+    if (freshPairing) assertFreshPairingSafe(fs.readdirSync(DATA_DIR));
     await stopSocket();
-    if (freshPairing) {
-      fs.rmSync(DATA_DIR, { recursive: true, force: true });
-      fs.mkdirSync(DATA_DIR, { recursive: true });
-      console.log('[wa] cleared stale auth before fresh pairing');
-    }
     status = 'starting';
     latestQr = null;
     latestQrDataUrl = null;
@@ -581,7 +581,6 @@ async function removeTemporaryLabels(dryRun=false){
   const byName=labelsByName(); const ids=[...TEMP_LABEL_NAMES].map(n=>byName.get(norm(n).toLowerCase())).filter(Boolean);
   const removed=[];
   for(const [jid,labs] of Object.entries(CRM.state.chatLabels||{})){
-    if(jid.endsWith('@g.us')) continue;
     for(const id of ids){
       if((labs||[]).map(String).includes(String(id))){
         if(!dryRun) await sock.chatModify({ removeChatLabel:{labelId:String(id)} }, jid);
@@ -593,13 +592,12 @@ async function removeTemporaryLabels(dryRun=false){
   if(!dryRun) CRM.saveNow();
   return removed;
 }
-async function clearProfessionalGroups(dryRun=false){
-  const protectedLabelId=labelsByName().get(CLIENT_GROUP_LABEL_NAME.toLowerCase());
+// CEO 16/10/2026: clear ONLY the messages of archived groups; never delete/leave groups.
+const isArchivedGroup = g => !!g?.id?.endsWith('@g.us') && CRM.state.chats?.[g.id]?.archived === true;
+async function clearArchivedGroups(dryRun=false){
   const results=[];
   for(const g of Object.values(CRM.state.groups||{})){
-    const labels=(CRM.state.chatLabels[g.id]||[]).map(String);
-    const protectedGroup=isClientGroup(g) || (protectedLabelId && labels.includes(String(protectedLabelId)));
-    if(protectedGroup || !isProfessionalGroup(g)) continue;
+    if(!isArchivedGroup(g)) continue;
     const msgs=(CRM.getMessages(g.id,{limit:500}).messages||[]).filter(m=>!m.deleted);
     if(!msgs.length){results.push({id:g.id,name:g.subject,cleared:0});continue;}
     if(!dryRun){
@@ -612,11 +610,15 @@ async function clearProfessionalGroups(dryRun=false){
   return results;
 }
 async function runKeroMaintenance({dryRun=false}={}){
+  // Opt-in only: never clear messages or mutate labels by accident.
+  if (!dryRun && process.env.CRM_ALLOW_DESTRUCTIVE_MAINTENANCE !== '1') throw new Error('destructive_maintenance_disabled');
   if(!sock || status!=='open') throw new Error('whatsapp_not_connected');
-  const clientLabel=await ensureClientGroupLabel(dryRun);
+  // CEO midnight scope is limited to two temporary labels and archived-group message history.
+  // Permanent client-group labeling remains a separate administrative action.
+  const clientLabel={skipped:true,reason:'not_part_of_midnight_policy'};
   const tempLabels=await removeTemporaryLabels(dryRun);
-  const groups=await clearProfessionalGroups(dryRun);
-  const result={dryRun,at:new Date().toISOString(),clientLabel,tempLabelsRemoved:tempLabels.length,professionalGroups:groups,totalMessages:groups.reduce((n,x)=>n+x.cleared,0)};
+  const groups=await clearArchivedGroups(dryRun);
+  const result={dryRun,at:new Date().toISOString(),clientLabel,tempLabelsRemoved:tempLabels.length,archivedGroups:groups,totalMessages:groups.reduce((n,x)=>n+x.cleared,0)};
   if(!dryRun){maintenanceState.lastRun=result.at;maintenanceState.lastResult=result;saveMaintenance();}
   return result;
 }
@@ -629,10 +631,10 @@ setInterval(async ()=>{
   try{
     const parts=Object.fromEntries(new Intl.DateTimeFormat('en-CA',{timeZone:'America/Sao_Paulo',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(new Date()).filter(x=>x.type!=='literal').map(x=>[x.type,x.value]));
     const date=parts.year+'-'+parts.month+'-'+parts.day;
-    if(parts.hour==='00' && Number(parts.minute)<10 && maintenanceState.lastDate!==date && status==='open'){
+    if(process.env.CRM_ALLOW_DESTRUCTIVE_MAINTENANCE === '1' && process.env.CRM_NIGHTLY_MAINTENANCE === '1' && parts.hour==='00' && Number(parts.minute)<10 && maintenanceState.lastDate!==date && status==='open'){
       const result=await runKeroMaintenance({dryRun:false});
       maintenanceState.lastDate=date;maintenanceState.lastResult=result;saveMaintenance();
-      console.log('[maintenance] midnight completed', {date,temp:result.tempLabelsRemoved,groups:result.professionalGroups.length,messages:result.totalMessages});
+      console.log('[maintenance] midnight completed', {date,temp:result.tempLabelsRemoved,groups:result.archivedGroups.length,messages:result.totalMessages});
     }
   }catch(error){console.error('[maintenance] midnight failed',error?.message||error);}
 },60000);
