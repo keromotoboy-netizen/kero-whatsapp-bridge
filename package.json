@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
-    "postinstall": "patch-package && node scripts/fix-ack.mjs"
+    "postinstall": "patch-package && node scripts/fix-ack.mjs",
+    "check": "node --check server.mjs && node --check crm-store.mjs && node --check ai-engine.mjs",
+    "test": "node --test"
   },
   "dependencies": {
     "baileys": "7.0.0-rc14",
