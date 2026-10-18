@@ -8,6 +8,7 @@ import QRCode from 'qrcode';
 import pino from 'pino';
 import fs from 'node:fs';
 import { createCrmStore } from './crm-store.mjs';
+import { createOutboxWorker, parseAllowedJids } from './outbox-worker.mjs';
 
 const app = express();
 app.use(express.json({ limit: '24mb' }));
@@ -566,6 +567,28 @@ setInterval(async ()=>{
     }
   }catch(error){console.error('[maintenance] midnight failed',error?.message||error);}
 },60000);
+
+// KERO 17/10/2026: fila brain.whatsapp_outbox — avisos enviados pelo servidor, sem navegador aberto.
+// Opt-in: WA_OUTBOX_ENABLED=1 + SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY + WA_OUTBOX_ALLOWED_JIDS (lista separada por vírgula).
+if (process.env.WA_OUTBOX_ENABLED === '1' && process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
+  const outbox = createOutboxWorker({
+    supabaseUrl: process.env.SUPABASE_URL,
+    serviceKey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+    allowedJids: parseAllowedJids(process.env.WA_OUTBOX_ALLOWED_JIDS),
+    isReady: () => !!sock && status === 'open',
+    // Mesma lógica da rota POST /crm/send.
+    send: async (jid, text) => {
+      if (!sock || status !== 'open') throw new Error('whatsapp_not_connected');
+      const targetJid = await resolveOutboundJid(jid);
+      if (jid.endsWith('@lid') && targetJid === jid) throw new Error('contact_number_still_syncing');
+      const sent = await sock.sendMessage(targetJid, { text });
+      if (sent) CRM.upsertMessage(sent);
+      return { messageId: sent?.key?.id || null };
+    }
+  });
+  setInterval(() => { outbox.tick().then(r => { if (r.claimed) console.log('[outbox] tick', r); }); }, Number(process.env.WA_OUTBOX_INTERVAL_MS || 20000));
+  console.log('[outbox] worker enabled');
+}
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Kero WhatsApp Bridge listening on ${PORT}`);
