@@ -30,7 +30,7 @@ function fixture(){
       'g-active@g.us':['42'],
       'direct@s.whatsapp.net':['41','42']
     }
-  },getMessages:(jid)=>messages[jid]||[],saveNow:()=>events.push({operation:'save'})};
+  },getMessages:(jid)=>({messages:messages[jid]||[]}),saveNow:()=>events.push({operation:'save'})};
   const sock={chatModify:async(arg,jid)=>events.push({operation:'chatModify',arg,jid})};
   const sleep=async()=>{};
   return {CRM,sock,sleep,events};
