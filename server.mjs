@@ -642,10 +642,14 @@ setInterval(async ()=>{
 
 // KERO 17/10/2026: fila brain.whatsapp_outbox — avisos enviados pelo servidor, sem navegador aberto.
 // Opt-in: WA_OUTBOX_ENABLED=1 + SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY + WA_OUTBOX_ALLOWED_JIDS (lista separada por vírgula).
-if (process.env.WA_OUTBOX_ENABLED === '1' && process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
+// KERO 18/10/2026: KERO_QUEUE_URL + KERO_QUEUE_TOKEN trocam a fila para o Cloudflare (sem eles, segue Supabase).
+const outboxOnCloudflare = !!(process.env.KERO_QUEUE_URL && process.env.KERO_QUEUE_TOKEN);
+if (process.env.WA_OUTBOX_ENABLED === '1' && (outboxOnCloudflare || (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY))) {
   const outbox = createOutboxWorker({
     supabaseUrl: process.env.SUPABASE_URL,
     serviceKey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+    queueUrl: outboxOnCloudflare ? process.env.KERO_QUEUE_URL : '',
+    queueToken: process.env.KERO_QUEUE_TOKEN,
     allowedJids: parseAllowedJids(process.env.WA_OUTBOX_ALLOWED_JIDS),
     isReady: () => !!sock && status === 'open',
     // Mesma lógica da rota POST /crm/send.
@@ -659,7 +663,7 @@ if (process.env.WA_OUTBOX_ENABLED === '1' && process.env.SUPABASE_URL && process
     }
   });
   setInterval(() => { outbox.tick().then(r => { if (r.claimed) console.log('[outbox] tick', r); }); }, Number(process.env.WA_OUTBOX_INTERVAL_MS || 20000));
-  console.log('[outbox] worker enabled');
+  console.log('[outbox] worker enabled', outboxOnCloudflare ? '(cloudflare)' : '(supabase)');
 }
 
 app.listen(PORT, '0.0.0.0', () => {

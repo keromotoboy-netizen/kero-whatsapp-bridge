@@ -9,6 +9,8 @@ export function parseAllowedJids(value) {
 export function createOutboxWorker({
   supabaseUrl,
   serviceKey,
+  queueUrl,
+  queueToken,
   send,
   isReady,
   allowedJids,
@@ -18,9 +20,27 @@ export function createOutboxWorker({
   logger = console
 }) {
   const base = String(supabaseUrl || '').replace(/\/+$/, '');
+  const qbase = String(queueUrl || '').replace(/\/+$/, '');
   let running = false;
 
+  // KERO 18/10/2026: com queueUrl, a fila fica no Cloudflare (Worker kero-nervoso-api + D1), mesma semântica das RPCs.
+  async function queue(name, body) {
+    const path = name === 'wa_outbox_claim' ? '/wa/claim' : '/wa/complete';
+    const payload = name === 'wa_outbox_claim'
+      ? { limit: body.p_limit, worker: body.p_worker }
+      : { id: body.p_id, message_id: body.p_message_id, error: body.p_error };
+    const res = await fetchImpl(`${qbase}${path}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${queueToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) throw new Error(`outbox_queue_${name}_http_${res.status}`);
+    const data = (await res.json()).data;
+    return name === 'wa_outbox_claim' ? (data || []) : data;
+  }
+
   async function rpc(name, body) {
+    if (qbase) return queue(name, body);
     const res = await fetchImpl(`${base}/rest/v1/rpc/${name}`, {
       method: 'POST',
       headers: {

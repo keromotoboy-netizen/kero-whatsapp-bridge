@@ -63,3 +63,21 @@ test('does not claim anything while WhatsApp is not connected', async () => {
   assert.deepEqual(await w.tick(), { skipped: true });
   assert.equal(sb.calls.length, 0);
 });
+
+test('cloudflare queue backend maps claim/complete to Worker routes', async () => {
+  const calls = [];
+  const fetchImpl = async (url, opts) => {
+    calls.push({ url, body: JSON.parse(opts.body), auth: opts.headers.Authorization });
+    const data = url.endsWith('/wa/claim') ? [{ id: 9, jid: VICTOR, text: 'cf' }] : { id: 9 };
+    return { ok: true, status: 200, json: async () => ({ ok: true, data }) };
+  };
+  const w = createOutboxWorker({
+    queueUrl: 'https://q.example.dev/', queueToken: 't', isReady: () => true,
+    allowedJids: parseAllowedJids(VICTOR), fetchImpl,
+    send: async () => ({ messageId: 'M9' })
+  });
+  const r = await w.tick();
+  assert.deepEqual(r, { claimed: 1, sent: 1, failed: 0 });
+  assert.deepEqual(calls[0], { url: 'https://q.example.dev/wa/claim', body: { limit: 5, worker: 'kero-whatsapp-bridge' }, auth: 'Bearer t' });
+  assert.deepEqual(calls[1], { url: 'https://q.example.dev/wa/complete', body: { id: 9, message_id: 'M9', error: null }, auth: 'Bearer t' });
+});
