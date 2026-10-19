@@ -10,7 +10,7 @@ import fs from 'node:fs';
 import { createCrmStore } from './crm-store.mjs';
 import { createOutboxWorker, parseAllowedJids } from './outbox-worker.mjs';
 import { createAiEngine } from './ai-engine.mjs';
-import { assertFreshPairingSafe } from './pairing-safety.mjs';
+import { selectAuthDirectory } from './auth-directory.mjs';
 import { maintenanceMutationAllowed, scheduledMaintenanceAllowed } from './maintenance-permissions.mjs';
 
 const app = express();
@@ -117,6 +117,8 @@ const AI = createAiEngine({
 });
 
 async function stopSocket() {
+  // A deliberately closed old socket must not overwrite the new pairing status.
+  sock?.ev?.removeAllListeners('connection.update');
   try {
     if (sock?.ws) sock.ws.close();
   } catch {}
@@ -141,9 +143,10 @@ async function startSession(mode, phone = null) {
   startLock = (async () => {
     const freshPairing = mode === 'qr' || mode === 'phone';
     if (freshPairing && status === 'open') return publicState();
-    // Refuse a new QR/phone pairing when any saved auth or CRM data exists.
-    // The production session must never be erased by a UI pairing action.
-    if (freshPairing) assertFreshPairingSafe(fs.readdirSync(DATA_DIR));
+    const authDir = selectAuthDirectory(DATA_DIR, {
+      freshPairing,
+      loggedOut: lastError?.loggedOut === true && Number(lastError?.code) === 401
+    });
     await stopSocket();
     status = 'starting';
     latestQr = null;
@@ -153,7 +156,7 @@ async function startSession(mode, phone = null) {
     lastError = null;
     phoneInUse = phone;
 
-    const { state, saveCreds } = await useMultiFileAuthState(DATA_DIR);
+    const { state, saveCreds } = await useMultiFileAuthState(authDir);
     const { version } = await fetchLatestBaileysVersion();
     let pairingRequested = false;
 
@@ -224,7 +227,7 @@ async function startSession(mode, phone = null) {
 
         const loggedOut = code === DisconnectReason.loggedOut;
         const hasSavedSession = !!state?.creds?.registered;
-        const hasPersistedCredentials = fs.existsSync(DATA_DIR + '/creds.json');
+        const hasPersistedCredentials = fs.existsSync(authDir + '/creds.json');
         const shouldReconnect =
           !loggedOut &&
           (mode === 'resume' || hasSavedSession || hasPersistedCredentials);
