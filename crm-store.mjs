@@ -152,6 +152,11 @@ export function createCrmStore(dataDir) {
   } catch (error) {
     console.error('[crm] failed to load state', error?.message || error);
   }
+  let prunedArchived = 0;
+  for (const [jid, chat] of Object.entries(state.chats || {})) {
+    if (chat?.archived && state.messages[jid]) { delete state.messages[jid]; prunedArchived++; }
+  }
+  if (prunedArchived) console.log('[crm] archived chats pruned=' + prunedArchived);
 
   const saveNow = () => {
     try {
@@ -206,6 +211,8 @@ export function createCrmStore(dataDir) {
       if (previousLastMessage) chat.lastMessage = previousLastMessage;
     }
     if (typeof input.archived === 'boolean') chat.archived = input.archived;
+    // Conversas arquivadas no WhatsApp Business não guardam mensagens no CRM (decisão CEO 20/10/2026).
+    if (chat.archived) delete state.messages[jid];
     if (typeof input.unreadCount === 'number') chat.unreadCount = Math.max(0, input.unreadCount);
     touch();
   };
@@ -300,13 +307,16 @@ export function createCrmStore(dataDir) {
       } : null
     };
 
-    const arr = state.messages[jid] ||= [];
-    const idx = arr.findIndex(x => x.id === id);
-    if (idx >= 0) arr[idx] = { ...arr[idx], ...item };
-    else arr.push(item);
-    arr.sort((a,b) => a.timestamp - b.timestamp);
-    if (MAX_MESSAGES_PER_CHAT > 0 && arr.length > MAX_MESSAGES_PER_CHAT) {
-      arr.splice(0, arr.length - MAX_MESSAGES_PER_CHAT);
+    let idx = -1;
+    if (!chat.archived) {
+      const arr = state.messages[jid] ||= [];
+      idx = arr.findIndex(x => x.id === id);
+      if (idx >= 0) arr[idx] = { ...arr[idx], ...item };
+      else arr.push(item);
+      arr.sort((a,b) => a.timestamp - b.timestamp);
+      if (MAX_MESSAGES_PER_CHAT > 0 && arr.length > MAX_MESSAGES_PER_CHAT) {
+        arr.splice(0, arr.length - MAX_MESSAGES_PER_CHAT);
+      }
     }
 
     const previousLastTs = Number(chat.lastMessageTimestamp || chat.conversationTimestamp || 0);
