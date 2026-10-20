@@ -137,7 +137,8 @@ const safeNameFromJid = jid => {
   return jid.split('@')[0]?.replace(/\D/g, '') || jid;
 };
 
-export function createCrmStore(dataDir) {
+export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, onMedia = null,
+  keepMessagesPerChat = Math.max(0, Number(process.env.CRM_KEEP_MESSAGES_PER_CHAT || 0)) && Math.max(50, Number(process.env.CRM_KEEP_MESSAGES_PER_CHAT)) } = {}) {
   const file = path.join(path.dirname(dataDir), 'crm-state.json');
   let state = {
     version: 1, rev: 0, updatedAt: Date.now(),
@@ -151,6 +152,24 @@ export function createCrmStore(dataDir) {
     }
   } catch (error) {
     console.error('[crm] failed to load state', error?.message || error);
+  }
+  let prunedArchived = 0;
+  for (const [jid, chat] of Object.entries(state.chats || {})) {
+    if (chat?.archived && state.messages[jid]) { delete state.messages[jid]; prunedArchived++; }
+  }
+  if (prunedArchived) console.log('[crm] archived chats pruned=' + prunedArchived);
+  // KERO 20/10/2026 (CRM etapa 6, enxugar Railway): com o espelho D1 ligado, o histórico completo fica no Cloudflare
+  // e o bridge guarda só as últimas N por conversa (CRM_KEEP_MESSAGES_PER_CHAT, mínimo 50). Sem espelho, não poda.
+  if (mirror && keepMessagesPerChat > 0) {
+    let trimmed = 0;
+    for (const [jid, arr] of Object.entries(state.messages || {})) {
+      if (Array.isArray(arr) && arr.length > keepMessagesPerChat) {
+        arr.sort((a, b) => Number(a?.timestamp || 0) - Number(b?.timestamp || 0));
+        trimmed += arr.length - keepMessagesPerChat;
+        state.messages[jid] = arr.slice(-keepMessagesPerChat);
+      }
+    }
+    if (trimmed) console.log('[crm] enxuto: mensagens antigas so no D1 =' + trimmed);
   }
 
   const saveNow = () => {
@@ -190,7 +209,16 @@ export function createCrmStore(dataDir) {
     if (!jid || jid === 'status@broadcast') return null;
     state.chats[jid] ||= { id: jid, archived: false, unreadCount: 0 };
     return state.chats[jid];
-  };  const upsertChat = input => {
+  };
+
+  // espelho D1 sempre usa o jid canônico (número), igual ao painel: LID e número viram uma conversa só
+  mirror?.bind(jid => {
+    const c = state.chats[jid] || state.chats[state.lidMap[jid]];
+    if (!c) return null;
+    return { jid, name: chatName(jid), archived: !!c.archived, unread: Number(c.unreadCount || 0),
+      last_ts: Number(c.lastMessageTimestamp || c.conversationTimestamp || 0) || null, last_message: c.lastMessage || null };
+  });
+  const upsertChat = input => {
     const jid = input?.id;
     if (!jid || jid === 'status@broadcast') return;
     const chat = ensureChat(jid);
@@ -206,7 +234,10 @@ export function createCrmStore(dataDir) {
       if (previousLastMessage) chat.lastMessage = previousLastMessage;
     }
     if (typeof input.archived === 'boolean') chat.archived = input.archived;
+    // Conversas arquivadas no WhatsApp Business não guardam mensagens no CRM (decisão CEO 20/10/2026).
+    if (chat.archived) delete state.messages[jid];
     if (typeof input.unreadCount === 'number') chat.unreadCount = Math.max(0, input.unreadCount);
+    mirror?.chat(canonicalJid(jid));
     touch();
   };
 
@@ -300,13 +331,17 @@ export function createCrmStore(dataDir) {
       } : null
     };
 
-    const arr = state.messages[jid] ||= [];
-    const idx = arr.findIndex(x => x.id === id);
-    if (idx >= 0) arr[idx] = { ...arr[idx], ...item };
-    else arr.push(item);
-    arr.sort((a,b) => a.timestamp - b.timestamp);
-    if (MAX_MESSAGES_PER_CHAT > 0 && arr.length > MAX_MESSAGES_PER_CHAT) {
-      arr.splice(0, arr.length - MAX_MESSAGES_PER_CHAT);
+    let idx = -1;
+    if (!chat.archived) {
+      const arr = state.messages[jid] ||= [];
+      idx = arr.findIndex(x => x.id === id);
+      if (idx >= 0) arr[idx] = { ...arr[idx], ...item };
+      else arr.push(item);
+      arr.sort((a,b) => a.timestamp - b.timestamp);
+      if (MAX_MESSAGES_PER_CHAT > 0 && arr.length > MAX_MESSAGES_PER_CHAT) {
+        arr.splice(0, arr.length - MAX_MESSAGES_PER_CHAT);
+      }
+      if (mirror && keepMessagesPerChat > 0 && arr.length > keepMessagesPerChat) arr.splice(0, arr.length - keepMessagesPerChat);
     }
 
     const previousLastTs = Number(chat.lastMessageTimestamp || chat.conversationTimestamp || 0);
@@ -316,6 +351,14 @@ export function createCrmStore(dataDir) {
     }
     if (raw.pushName && !chat.pushName) chat.pushName = raw.pushName;
     if (countUnread && idx < 0 && !item.fromMe) chat.unreadCount = Number(chat.unreadCount || 0) + 1;
+    // mídia completa de mensagem nova ao vivo vai ao R2 (chave determinística em media.r2Key)
+    if (onMedia && countUnread && item.media && !chat.archived) {
+      const key = onMedia(raw, canonicalJid(jid), item.media);
+      if (key) item.media.r2Key = key;
+    }
+    // histórico antigo (replay da sincronização) não vai ao D1; carga inicial é feita em lote separado
+    if (mirror && !chat.archived && (countUnread || ts * 1000 >= Date.now() - mirrorHistoryDays * 86400000)) mirror.message({ ...item, jid: canonicalJid(jid) });
+    else mirror?.chat(canonicalJid(jid));
     touch();
   };
 
@@ -338,6 +381,7 @@ export function createCrmStore(dataDir) {
         item.deleted = true;
         item.deletedAt = Date.now();
       }
+      mirror?.remove(canonicalJid(jid), id);
     }
     touch();
   };
@@ -352,6 +396,16 @@ export function createCrmStore(dataDir) {
       if (!jid || !id) continue;
       const arr = state.messages[jid] || [];
       const item = arr.find(x => x.id === id);
+
+      // WhatsApp can report SERVER_ACK(1), DELIVERY_ACK(2), READ(3), PLAYED(4)
+      // asynchronously. Only store monotonic numeric status; never log message data.
+      if (item && Number.isInteger(update.status) && update.status >= 0 && update.status <= 4) {
+        const previous = Number.isInteger(item.deliveryStatus) ? item.deliveryStatus : -1;
+        if (update.status > previous) {
+          item.deliveryStatus = update.status;
+          changed = true;
+        }
+      }
 
       if (update.message === null && Number(update.messageStubType) === Number(WAMessageStubType.REVOKE)) {
         if (item) {

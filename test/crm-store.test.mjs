@@ -150,3 +150,25 @@ test('archive filter returns archived chats independently from active chats', ()
   assert.equal(store.snapshot({ archived: false }).chats.length, 1);
   assert.equal(store.snapshot({ archived: true }).chats.length, 1);
 });
+
+test('conversas arquivadas nao guardam mensagens e sao podadas ao carregar', () => {
+  const { root, store } = makeStore();
+  const ativa = '5511911110000@s.whatsapp.net';
+  const arquivada = '5511922220000@s.whatsapp.net';
+  store.upsertMessage(message({ id: 'a1', jid: ativa, ts: 10, text: 'ativa' }));
+  store.upsertMessage(message({ id: 'b1', jid: arquivada, ts: 10, text: 'antes' }));
+  store.upsertChat({ id: arquivada, archived: true });
+  assert.equal(store.getMessages(arquivada, { limit: 50 }).total, 0);
+  store.upsertMessage(message({ id: 'b2', jid: arquivada, ts: 20, text: 'depois' }));
+  assert.equal(store.getMessages(arquivada, { limit: 50 }).total, 0);
+  assert.equal(store.getMessages(ativa, { limit: 50 }).total, 1);
+  store.saveNow();
+  // estado salvo com mensagens antigas de arquivada deve ser podado ao carregar
+  const file = path.join(root, 'crm-state.json');
+  const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+  saved.messages[arquivada] = [{ id: 'x', timestamp: 1, text: 'velha' }];
+  fs.writeFileSync(file, JSON.stringify(saved));
+  const reloaded = createCrmStore(path.join(root, 'auth'));
+  assert.equal(reloaded.getMessages(arquivada, { limit: 50 }).total, 0);
+  assert.equal(reloaded.getMessages(ativa, { limit: 50 }).total, 1);
+});

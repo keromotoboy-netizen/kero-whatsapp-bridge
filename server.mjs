@@ -1,5 +1,6 @@
 import express from 'express';
 import makeWASocket, {
+  downloadMediaMessage,
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   DisconnectReason
@@ -8,7 +9,12 @@ import QRCode from 'qrcode';
 import pino from 'pino';
 import fs from 'node:fs';
 import { createCrmStore } from './crm-store.mjs';
+import { createOutboxWorker, parseAllowedJids } from './outbox-worker.mjs';
+import { createD1Mirror } from './d1-mirror.mjs';
+import { createMediaUploader } from './media-r2.mjs';
 import { createAiEngine } from './ai-engine.mjs';
+import { selectAuthDirectory } from './auth-directory.mjs';
+import { maintenanceMutationAllowed, scheduledMaintenanceAllowed } from './maintenance-permissions.mjs';
 
 const app = express();
 app.use(express.json({ limit: '24mb' }));
@@ -22,7 +28,22 @@ if (!API_SECRET) {
   process.exit(1);
 }
 fs.mkdirSync(DATA_DIR, { recursive: true });
-const CRM = createCrmStore(DATA_DIR);
+// KERO 20/10/2026 (CRM etapa 3): CRM_D1_MIRROR=1 grava em dobro conversas/mensagens no D1 (usa a mesma fila Cloudflare).
+const d1Mirror = process.env.CRM_D1_MIRROR === '1' && process.env.KERO_QUEUE_URL && process.env.KERO_QUEUE_TOKEN
+  ? createD1Mirror({ queueUrl: process.env.KERO_QUEUE_URL, queueToken: process.env.KERO_QUEUE_TOKEN, dailyCap: Number(process.env.CRM_D1_DAILY_CAP || 40000) })
+  : null;
+// KERO 20/10/2026 (CRM etapa 5): CRM_MEDIA_R2=1 manda a mídia completa das mensagens novas ao R2 (via Worker).
+const mediaR2 = process.env.CRM_MEDIA_R2 === '1' && process.env.KERO_QUEUE_URL && process.env.KERO_QUEUE_TOKEN
+  ? createMediaUploader({ queueUrl: process.env.KERO_QUEUE_URL, queueToken: process.env.KERO_QUEUE_TOKEN,
+      dailyCap: Number(process.env.CRM_MEDIA_DAILY_CAP || 1500),
+      download: raw => downloadMediaMessage(raw, 'buffer', {}, { reuploadRequest: sock?.updateMediaMessage, logger: pino({ level: 'silent' }) }) })
+  : null;
+const CRM = createCrmStore(DATA_DIR, { mirror: d1Mirror, onMedia: mediaR2 ? mediaR2.enqueue : null });
+if (mediaR2) console.log('[media-r2] ligado');
+if (d1Mirror) {
+  setInterval(() => { d1Mirror.flush().catch(() => null); }, Number(process.env.CRM_D1_INTERVAL_MS || 5000));
+  console.log('[d1-mirror] ligado');
+}
 
 let sock = null;
 let status = 'idle';
@@ -114,6 +135,8 @@ const AI = createAiEngine({
 });
 
 async function stopSocket() {
+  // A deliberately closed old socket must not overwrite the new pairing status.
+  sock?.ev?.removeAllListeners('connection.update');
   try {
     if (sock?.ws) sock.ws.close();
   } catch {}
@@ -138,12 +161,11 @@ async function startSession(mode, phone = null) {
   startLock = (async () => {
     const freshPairing = mode === 'qr' || mode === 'phone';
     if (freshPairing && status === 'open') return publicState();
+    const authDir = selectAuthDirectory(DATA_DIR, {
+      freshPairing,
+      loggedOut: lastError?.loggedOut === true && Number(lastError?.code) === 401
+    });
     await stopSocket();
-    if (freshPairing) {
-      fs.rmSync(DATA_DIR, { recursive: true, force: true });
-      fs.mkdirSync(DATA_DIR, { recursive: true });
-      console.log('[wa] cleared stale auth before fresh pairing');
-    }
     status = 'starting';
     latestQr = null;
     latestQrDataUrl = null;
@@ -152,7 +174,7 @@ async function startSession(mode, phone = null) {
     lastError = null;
     phoneInUse = phone;
 
-    const { state, saveCreds } = await useMultiFileAuthState(DATA_DIR);
+    const { state, saveCreds } = await useMultiFileAuthState(authDir);
     const { version } = await fetchLatestBaileysVersion();
     let pairingRequested = false;
 
@@ -223,7 +245,7 @@ async function startSession(mode, phone = null) {
 
         const loggedOut = code === DisconnectReason.loggedOut;
         const hasSavedSession = !!state?.creds?.registered;
-        const hasPersistedCredentials = fs.existsSync(DATA_DIR + '/creds.json');
+        const hasPersistedCredentials = fs.existsSync(authDir + '/creds.json');
         const shouldReconnect =
           !loggedOut &&
           (mode === 'resume' || hasSavedSession || hasPersistedCredentials);
@@ -581,7 +603,6 @@ async function removeTemporaryLabels(dryRun=false){
   const byName=labelsByName(); const ids=[...TEMP_LABEL_NAMES].map(n=>byName.get(norm(n).toLowerCase())).filter(Boolean);
   const removed=[];
   for(const [jid,labs] of Object.entries(CRM.state.chatLabels||{})){
-    if(jid.endsWith('@g.us')) continue;
     for(const id of ids){
       if((labs||[]).map(String).includes(String(id))){
         if(!dryRun) await sock.chatModify({ removeChatLabel:{labelId:String(id)} }, jid);
@@ -593,13 +614,12 @@ async function removeTemporaryLabels(dryRun=false){
   if(!dryRun) CRM.saveNow();
   return removed;
 }
-async function clearProfessionalGroups(dryRun=false){
-  const protectedLabelId=labelsByName().get(CLIENT_GROUP_LABEL_NAME.toLowerCase());
+// CEO 16/10/2026: clear ONLY the messages of archived groups; never delete/leave groups.
+const isArchivedGroup = g => !!g?.id?.endsWith('@g.us') && CRM.state.chats?.[g.id]?.archived === true;
+async function clearArchivedGroups(dryRun=false){
   const results=[];
   for(const g of Object.values(CRM.state.groups||{})){
-    const labels=(CRM.state.chatLabels[g.id]||[]).map(String);
-    const protectedGroup=isClientGroup(g) || (protectedLabelId && labels.includes(String(protectedLabelId)));
-    if(protectedGroup || !isProfessionalGroup(g)) continue;
+    if(!isArchivedGroup(g)) continue;
     const msgs=(CRM.getMessages(g.id,{limit:500}).messages||[]).filter(m=>!m.deleted);
     if(!msgs.length){results.push({id:g.id,name:g.subject,cleared:0});continue;}
     if(!dryRun){
@@ -612,11 +632,15 @@ async function clearProfessionalGroups(dryRun=false){
   return results;
 }
 async function runKeroMaintenance({dryRun=false}={}){
+  // Opt-in only: never clear messages or mutate labels by accident.
+  if (!dryRun && process.env.CRM_ALLOW_DESTRUCTIVE_MAINTENANCE !== '1') throw new Error('destructive_maintenance_disabled');
   if(!sock || status!=='open') throw new Error('whatsapp_not_connected');
-  const clientLabel=await ensureClientGroupLabel(dryRun);
+  // CEO midnight scope is limited to two temporary labels and archived-group message history.
+  // Permanent client-group labeling remains a separate administrative action.
+  const clientLabel={skipped:true,reason:'not_part_of_midnight_policy'};
   const tempLabels=await removeTemporaryLabels(dryRun);
-  const groups=await clearProfessionalGroups(dryRun);
-  const result={dryRun,at:new Date().toISOString(),clientLabel,tempLabelsRemoved:tempLabels.length,professionalGroups:groups,totalMessages:groups.reduce((n,x)=>n+x.cleared,0)};
+  const groups=await clearArchivedGroups(dryRun);
+  const result={dryRun,at:new Date().toISOString(),clientLabel,tempLabelsRemoved:tempLabels.length,archivedGroups:groups,totalMessages:groups.reduce((n,x)=>n+x.cleared,0)};
   if(!dryRun){maintenanceState.lastRun=result.at;maintenanceState.lastResult=result;saveMaintenance();}
   return result;
 }
@@ -629,13 +653,39 @@ setInterval(async ()=>{
   try{
     const parts=Object.fromEntries(new Intl.DateTimeFormat('en-CA',{timeZone:'America/Sao_Paulo',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(new Date()).filter(x=>x.type!=='literal').map(x=>[x.type,x.value]));
     const date=parts.year+'-'+parts.month+'-'+parts.day;
-    if(parts.hour==='00' && Number(parts.minute)<10 && maintenanceState.lastDate!==date && status==='open'){
+    if(process.env.CRM_ALLOW_DESTRUCTIVE_MAINTENANCE === '1' && process.env.CRM_NIGHTLY_MAINTENANCE === '1' && parts.hour==='00' && Number(parts.minute)<10 && maintenanceState.lastDate!==date && status==='open'){
       const result=await runKeroMaintenance({dryRun:false});
       maintenanceState.lastDate=date;maintenanceState.lastResult=result;saveMaintenance();
-      console.log('[maintenance] midnight completed', {date,temp:result.tempLabelsRemoved,groups:result.professionalGroups.length,messages:result.totalMessages});
+      console.log('[maintenance] midnight completed', {date,temp:result.tempLabelsRemoved,groups:result.archivedGroups.length,messages:result.totalMessages});
     }
   }catch(error){console.error('[maintenance] midnight failed',error?.message||error);}
 },60000);
+
+// KERO 17/10/2026: fila brain.whatsapp_outbox — avisos enviados pelo servidor, sem navegador aberto.
+// Opt-in: WA_OUTBOX_ENABLED=1 + SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY + WA_OUTBOX_ALLOWED_JIDS (lista separada por vírgula).
+// KERO 18/10/2026: KERO_QUEUE_URL + KERO_QUEUE_TOKEN trocam a fila para o Cloudflare (sem eles, segue Supabase).
+const outboxOnCloudflare = !!(process.env.KERO_QUEUE_URL && process.env.KERO_QUEUE_TOKEN);
+if (process.env.WA_OUTBOX_ENABLED === '1' && (outboxOnCloudflare || (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY))) {
+  const outbox = createOutboxWorker({
+    supabaseUrl: process.env.SUPABASE_URL,
+    serviceKey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+    queueUrl: outboxOnCloudflare ? process.env.KERO_QUEUE_URL : '',
+    queueToken: process.env.KERO_QUEUE_TOKEN,
+    allowedJids: parseAllowedJids(process.env.WA_OUTBOX_ALLOWED_JIDS),
+    isReady: () => !!sock && status === 'open',
+    // Mesma lógica da rota POST /crm/send.
+    send: async (jid, text) => {
+      if (!sock || status !== 'open') throw new Error('whatsapp_not_connected');
+      const targetJid = await resolveOutboundJid(jid);
+      if (jid.endsWith('@lid') && targetJid === jid) throw new Error('contact_number_still_syncing');
+      const sent = await sock.sendMessage(targetJid, { text });
+      if (sent) CRM.upsertMessage(sent);
+      return { messageId: sent?.key?.id || null };
+    }
+  });
+  setInterval(() => { outbox.tick().then(r => { if (r.claimed) console.log('[outbox] tick', r); }); }, Number(process.env.WA_OUTBOX_INTERVAL_MS || 20000));
+  console.log('[outbox] worker enabled', outboxOnCloudflare ? '(cloudflare)' : '(supabase)');
+}
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Kero WhatsApp Bridge listening on ${PORT}`);
