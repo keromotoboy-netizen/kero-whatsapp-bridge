@@ -20,14 +20,16 @@ export function createD1Mirror({
     if (!item?.jid || !item?.id) return;
     const media = item.media ? { ...item.media } : null;
     if (media) delete media.thumbnail; // miniatura base64 não vai ao D1 (mídia fica para o R2, etapa 5)
-    msgs.set(item.jid + '|' + item.id, {
+    const key = item.jid + '|' + item.id;
+    msgs.delete(key); // reinsere no fim: a poda por tamanho descarta sempre o mais antigo
+    msgs.set(key, {
       jid: item.jid, id: item.id, fromMe: !!item.fromMe, participant: item.participant || null, pushName: item.pushName || null,
       timestamp: item.timestamp, type: item.type || null, text: item.text || null, media, location: item.location || null
     });
     trim(msgs);
-    chats.add(item.jid);
+    chat(item.jid);
   };
-  const chat = jid => { if (jid) chats.add(jid); };
+  const chat = jid => { if (jid) { chats.add(jid); while (chats.size > maxBuffer) chats.delete(chats.values().next().value); } };
   const remove = (jid, id) => { if (jid && id) { msgs.delete(jid + '|' + id); deleted.set(jid + '|' + id, { jid, id }); trim(deleted); } };
 
   async function flush() {
@@ -47,6 +49,7 @@ export function createD1Mirror({
       const row = resolveChat(jid);
       if (row) c.push([jid, row]); else chats.delete(jid);
     }
+    if (!c.length && !m.length && !d.length) { flushing = false; return { skipped: true }; }
     try {
       const res = await fetchImpl(`${base}/crm/ingest`, {
         method: 'POST',
