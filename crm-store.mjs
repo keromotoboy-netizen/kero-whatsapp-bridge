@@ -137,7 +137,7 @@ const safeNameFromJid = jid => {
   return jid.split('@')[0]?.replace(/\D/g, '') || jid;
 };
 
-export function createCrmStore(dataDir) {
+export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7 } = {}) {
   const file = path.join(path.dirname(dataDir), 'crm-state.json');
   let state = {
     version: 1, rev: 0, updatedAt: Date.now(),
@@ -195,7 +195,15 @@ export function createCrmStore(dataDir) {
     if (!jid || jid === 'status@broadcast') return null;
     state.chats[jid] ||= { id: jid, archived: false, unreadCount: 0 };
     return state.chats[jid];
-  };  const upsertChat = input => {
+  };
+
+  mirror?.bind(jid => {
+    const c = state.chats[jid];
+    if (!c) return null;
+    return { jid, name: chatName(jid), archived: !!c.archived, unread: Number(c.unreadCount || 0),
+      last_ts: Number(c.lastMessageTimestamp || c.conversationTimestamp || 0) || null, last_message: c.lastMessage || null };
+  });
+  const upsertChat = input => {
     const jid = input?.id;
     if (!jid || jid === 'status@broadcast') return;
     const chat = ensureChat(jid);
@@ -214,6 +222,7 @@ export function createCrmStore(dataDir) {
     // Conversas arquivadas no WhatsApp Business não guardam mensagens no CRM (decisão CEO 20/10/2026).
     if (chat.archived) delete state.messages[jid];
     if (typeof input.unreadCount === 'number') chat.unreadCount = Math.max(0, input.unreadCount);
+    mirror?.chat(jid);
     touch();
   };
 
@@ -326,6 +335,9 @@ export function createCrmStore(dataDir) {
     }
     if (raw.pushName && !chat.pushName) chat.pushName = raw.pushName;
     if (countUnread && idx < 0 && !item.fromMe) chat.unreadCount = Number(chat.unreadCount || 0) + 1;
+    // histórico antigo (replay da sincronização) não vai ao D1; carga inicial é feita em lote separado
+    if (mirror && !chat.archived && (countUnread || ts * 1000 >= Date.now() - mirrorHistoryDays * 86400000)) mirror.message(item);
+    else mirror?.chat(jid);
     touch();
   };
 
@@ -348,6 +360,7 @@ export function createCrmStore(dataDir) {
         item.deleted = true;
         item.deletedAt = Date.now();
       }
+      mirror?.remove(jid, id);
     }
     touch();
   };

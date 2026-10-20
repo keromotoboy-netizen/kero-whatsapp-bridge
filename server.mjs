@@ -9,6 +9,7 @@ import pino from 'pino';
 import fs from 'node:fs';
 import { createCrmStore } from './crm-store.mjs';
 import { createOutboxWorker, parseAllowedJids } from './outbox-worker.mjs';
+import { createD1Mirror } from './d1-mirror.mjs';
 import { createAiEngine } from './ai-engine.mjs';
 import { selectAuthDirectory } from './auth-directory.mjs';
 import { maintenanceMutationAllowed, scheduledMaintenanceAllowed } from './maintenance-permissions.mjs';
@@ -25,7 +26,15 @@ if (!API_SECRET) {
   process.exit(1);
 }
 fs.mkdirSync(DATA_DIR, { recursive: true });
-const CRM = createCrmStore(DATA_DIR);
+// KERO 20/10/2026 (CRM etapa 3): CRM_D1_MIRROR=1 grava em dobro conversas/mensagens no D1 (usa a mesma fila Cloudflare).
+const d1Mirror = process.env.CRM_D1_MIRROR === '1' && process.env.KERO_QUEUE_URL && process.env.KERO_QUEUE_TOKEN
+  ? createD1Mirror({ queueUrl: process.env.KERO_QUEUE_URL, queueToken: process.env.KERO_QUEUE_TOKEN, dailyCap: Number(process.env.CRM_D1_DAILY_CAP || 40000) })
+  : null;
+const CRM = createCrmStore(DATA_DIR, { mirror: d1Mirror });
+if (d1Mirror) {
+  setInterval(() => { d1Mirror.flush().catch(() => null); }, Number(process.env.CRM_D1_INTERVAL_MS || 5000));
+  console.log('[d1-mirror] ligado');
+}
 
 let sock = null;
 let status = 'idle';
