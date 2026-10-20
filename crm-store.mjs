@@ -197,8 +197,9 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7 }
     return state.chats[jid];
   };
 
+  // espelho D1 sempre usa o jid canônico (número), igual ao painel: LID e número viram uma conversa só
   mirror?.bind(jid => {
-    const c = state.chats[jid];
+    const c = state.chats[jid] || state.chats[state.lidMap[jid]];
     if (!c) return null;
     return { jid, name: chatName(jid), archived: !!c.archived, unread: Number(c.unreadCount || 0),
       last_ts: Number(c.lastMessageTimestamp || c.conversationTimestamp || 0) || null, last_message: c.lastMessage || null };
@@ -222,7 +223,7 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7 }
     // Conversas arquivadas no WhatsApp Business não guardam mensagens no CRM (decisão CEO 20/10/2026).
     if (chat.archived) delete state.messages[jid];
     if (typeof input.unreadCount === 'number') chat.unreadCount = Math.max(0, input.unreadCount);
-    mirror?.chat(jid);
+    mirror?.chat(canonicalJid(jid));
     touch();
   };
 
@@ -336,8 +337,8 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7 }
     if (raw.pushName && !chat.pushName) chat.pushName = raw.pushName;
     if (countUnread && idx < 0 && !item.fromMe) chat.unreadCount = Number(chat.unreadCount || 0) + 1;
     // histórico antigo (replay da sincronização) não vai ao D1; carga inicial é feita em lote separado
-    if (mirror && !chat.archived && (countUnread || ts * 1000 >= Date.now() - mirrorHistoryDays * 86400000)) mirror.message(item);
-    else mirror?.chat(jid);
+    if (mirror && !chat.archived && (countUnread || ts * 1000 >= Date.now() - mirrorHistoryDays * 86400000)) mirror.message({ ...item, jid: canonicalJid(jid) });
+    else mirror?.chat(canonicalJid(jid));
     touch();
   };
 
@@ -360,7 +361,7 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7 }
         item.deleted = true;
         item.deletedAt = Date.now();
       }
-      mirror?.remove(jid, id);
+      mirror?.remove(canonicalJid(jid), id);
     }
     touch();
   };

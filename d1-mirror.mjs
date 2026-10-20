@@ -50,6 +50,7 @@ export function createD1Mirror({
     try {
       const res = await fetchImpl(`${base}/crm/ingest`, {
         method: 'POST',
+        signal: AbortSignal.timeout(20000), // conexão presa não pode travar o espelho para sempre
         headers: { Authorization: `Bearer ${queueToken}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ chats: c.map(x => x[1]), messages: m.map(x => x[1]), deleted: d.map(x => x[1]) })
       });

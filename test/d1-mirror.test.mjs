@@ -70,3 +70,14 @@ test('apagada vai como deleted; teto diario segura envio', async () => {
   assert.equal((await mirror.flush()).capped, true);
   assert.equal(calls.length, 1);
 });
+
+test('mensagem de LID mapeado vai ao D1 com o numero (jid canonico)', async () => {
+  const { calls, store, mirror } = setup();
+  const lid = '123456789@lid', pn = '5511900000006@s.whatsapp.net';
+  store.upsertLidMapping({ lid, pn });
+  store.upsertMessage(msg('l1', lid, nowS()));
+  await mirror.flush();
+  const body = calls.at(-1).body;
+  assert.equal(body.messages[0].jid, pn);
+  assert.ok(body.chats.every(c => c.jid === pn));
+});
