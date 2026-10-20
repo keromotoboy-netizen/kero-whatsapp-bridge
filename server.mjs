@@ -1,5 +1,6 @@
 import express from 'express';
 import makeWASocket, {
+  downloadMediaMessage,
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   DisconnectReason
@@ -10,6 +11,7 @@ import fs from 'node:fs';
 import { createCrmStore } from './crm-store.mjs';
 import { createOutboxWorker, parseAllowedJids } from './outbox-worker.mjs';
 import { createD1Mirror } from './d1-mirror.mjs';
+import { createMediaUploader } from './media-r2.mjs';
 import { createAiEngine } from './ai-engine.mjs';
 import { selectAuthDirectory } from './auth-directory.mjs';
 import { maintenanceMutationAllowed, scheduledMaintenanceAllowed } from './maintenance-permissions.mjs';
@@ -30,7 +32,14 @@ fs.mkdirSync(DATA_DIR, { recursive: true });
 const d1Mirror = process.env.CRM_D1_MIRROR === '1' && process.env.KERO_QUEUE_URL && process.env.KERO_QUEUE_TOKEN
   ? createD1Mirror({ queueUrl: process.env.KERO_QUEUE_URL, queueToken: process.env.KERO_QUEUE_TOKEN, dailyCap: Number(process.env.CRM_D1_DAILY_CAP || 40000) })
   : null;
-const CRM = createCrmStore(DATA_DIR, { mirror: d1Mirror });
+// KERO 20/10/2026 (CRM etapa 5): CRM_MEDIA_R2=1 manda a mídia completa das mensagens novas ao R2 (via Worker).
+const mediaR2 = process.env.CRM_MEDIA_R2 === '1' && process.env.KERO_QUEUE_URL && process.env.KERO_QUEUE_TOKEN
+  ? createMediaUploader({ queueUrl: process.env.KERO_QUEUE_URL, queueToken: process.env.KERO_QUEUE_TOKEN,
+      dailyCap: Number(process.env.CRM_MEDIA_DAILY_CAP || 1500),
+      download: raw => downloadMediaMessage(raw, 'buffer', {}, { reuploadRequest: sock?.updateMediaMessage, logger: pino({ level: 'silent' }) }) })
+  : null;
+const CRM = createCrmStore(DATA_DIR, { mirror: d1Mirror, onMedia: mediaR2 ? mediaR2.enqueue : null });
+if (mediaR2) console.log('[media-r2] ligado');
 if (d1Mirror) {
   setInterval(() => { d1Mirror.flush().catch(() => null); }, Number(process.env.CRM_D1_INTERVAL_MS || 5000));
   console.log('[d1-mirror] ligado');

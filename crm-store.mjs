@@ -137,7 +137,7 @@ const safeNameFromJid = jid => {
   return jid.split('@')[0]?.replace(/\D/g, '') || jid;
 };
 
-export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7 } = {}) {
+export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, onMedia = null } = {}) {
   const file = path.join(path.dirname(dataDir), 'crm-state.json');
   let state = {
     version: 1, rev: 0, updatedAt: Date.now(),
@@ -336,6 +336,11 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7 }
     }
     if (raw.pushName && !chat.pushName) chat.pushName = raw.pushName;
     if (countUnread && idx < 0 && !item.fromMe) chat.unreadCount = Number(chat.unreadCount || 0) + 1;
+    // mídia completa de mensagem nova ao vivo vai ao R2 (chave determinística em media.r2Key)
+    if (onMedia && countUnread && item.media && !chat.archived) {
+      const key = onMedia(raw, canonicalJid(jid), item.media);
+      if (key) item.media.r2Key = key;
+    }
     // histórico antigo (replay da sincronização) não vai ao D1; carga inicial é feita em lote separado
     if (mirror && !chat.archived && (countUnread || ts * 1000 >= Date.now() - mirrorHistoryDays * 86400000)) mirror.message({ ...item, jid: canonicalJid(jid) });
     else mirror?.chat(canonicalJid(jid));
