@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { WAMessageStubType } from 'baileys';
+import { readSnapshot, writeSnapshot, snapshotStorageMetrics } from './snapshot-storage.mjs';
 
 const configuredMessageCap = Number(process.env.CRM_MAX_MESSAGES_PER_CHAT || 0);
 const MAX_MESSAGES_PER_CHAT =
@@ -145,19 +146,25 @@ export function createCrmStore(dataDir) {
     labels: {}, chatLabels: {}, lidMap: {}, presences: {}
   };
   let saveTimer = null;  try {
-    if (fs.existsSync(file)) {
-      const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const parsed = readSnapshot(file);
+    if (parsed) {
       state = { ...state, ...parsed };
     }
   } catch (error) {
-    console.error('[crm] failed to load state', error?.message || error);
+    console.error('[crm] snapshot load failed', error?.code || error?.name);
+    throw new Error('crm_snapshot_load_failed');
   }
+  console.log('[crm] storage metrics', JSON.stringify(snapshotStorageMetrics(file)));
+  let firstPersist = true;
 
   const saveNow = () => {
     try {
       state.updatedAt = Date.now();
-      fs.writeFileSync(file + '.tmp', JSON.stringify(state));
-      fs.renameSync(file + '.tmp', file);
+      writeSnapshot(file, state);
+      if (firstPersist) {
+        console.log('[crm] compressed snapshot persisted', JSON.stringify(snapshotStorageMetrics(file)));
+        firstPersist = false;
+      }
     } catch (error) {
       console.error('[crm] failed to save state', error?.message || error);
     }
