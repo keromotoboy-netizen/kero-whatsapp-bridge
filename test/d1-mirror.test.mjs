@@ -81,3 +81,21 @@ test('mensagem de LID mapeado vai ao D1 com o numero (jid canonico)', async () =
   assert.equal(body.messages[0].jid, pn);
   assert.ok(body.chats.every(c => c.jid === pn));
 });
+
+test('enxuto: com espelho, guarda so as ultimas N; sem espelho, nao poda', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kero-keep-'));
+  fs.mkdirSync(path.join(root, 'auth'));
+  const jid = '5511900000008@s.whatsapp.net';
+  const sem = createCrmStore(path.join(root, 'auth'), { keepMessagesPerChat: 50 });
+  for (let i = 1; i <= 80; i++) sem.upsertMessage(msg('k' + i, jid, 1000 + i), { countUnread: false });
+  assert.equal(sem.getMessages(jid, { limit: 500 }).total, 80);
+  sem.saveNow();
+  const calls = [];
+  const mirror = createD1Mirror({ queueUrl: 'https://x.test', queueToken: 't', fetchImpl: fakeFetch(calls), logger: quiet });
+  const com = createCrmStore(path.join(root, 'auth'), { mirror, keepMessagesPerChat: 50 });
+  const page = com.getMessages(jid, { limit: 500 });
+  assert.equal(page.total, 50);
+  assert.equal(page.messages[0].timestamp, 1031);
+  com.upsertMessage(msg('k81', jid, 1081), { countUnread: false });
+  assert.equal(com.getMessages(jid, { limit: 500 }).total, 50);
+});

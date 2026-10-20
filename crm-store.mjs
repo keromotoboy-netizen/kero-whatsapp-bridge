@@ -137,7 +137,8 @@ const safeNameFromJid = jid => {
   return jid.split('@')[0]?.replace(/\D/g, '') || jid;
 };
 
-export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, onMedia = null } = {}) {
+export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, onMedia = null,
+  keepMessagesPerChat = Math.max(0, Number(process.env.CRM_KEEP_MESSAGES_PER_CHAT || 0)) && Math.max(50, Number(process.env.CRM_KEEP_MESSAGES_PER_CHAT)) } = {}) {
   const file = path.join(path.dirname(dataDir), 'crm-state.json');
   let state = {
     version: 1, rev: 0, updatedAt: Date.now(),
@@ -157,6 +158,19 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
     if (chat?.archived && state.messages[jid]) { delete state.messages[jid]; prunedArchived++; }
   }
   if (prunedArchived) console.log('[crm] archived chats pruned=' + prunedArchived);
+  // KERO 20/10/2026 (CRM etapa 6, enxugar Railway): com o espelho D1 ligado, o histórico completo fica no Cloudflare
+  // e o bridge guarda só as últimas N por conversa (CRM_KEEP_MESSAGES_PER_CHAT, mínimo 50). Sem espelho, não poda.
+  if (mirror && keepMessagesPerChat > 0) {
+    let trimmed = 0;
+    for (const [jid, arr] of Object.entries(state.messages || {})) {
+      if (Array.isArray(arr) && arr.length > keepMessagesPerChat) {
+        arr.sort((a, b) => Number(a?.timestamp || 0) - Number(b?.timestamp || 0));
+        trimmed += arr.length - keepMessagesPerChat;
+        state.messages[jid] = arr.slice(-keepMessagesPerChat);
+      }
+    }
+    if (trimmed) console.log('[crm] enxuto: mensagens antigas so no D1 =' + trimmed);
+  }
 
   const saveNow = () => {
     try {
@@ -327,6 +341,7 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
       if (MAX_MESSAGES_PER_CHAT > 0 && arr.length > MAX_MESSAGES_PER_CHAT) {
         arr.splice(0, arr.length - MAX_MESSAGES_PER_CHAT);
       }
+      if (mirror && keepMessagesPerChat > 0 && arr.length > keepMessagesPerChat) arr.splice(0, arr.length - keepMessagesPerChat);
     }
 
     const previousLastTs = Number(chat.lastMessageTimestamp || chat.conversationTimestamp || 0);
