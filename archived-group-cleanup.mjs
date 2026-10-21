@@ -10,7 +10,7 @@ function exactObject(value,keys){
 
 // Capabilities are deliberately limited: the only remote mutation is chatModify(clear).
 // Plans live in memory, have a fixed message cutoff and are consumed before any I/O.
-export function createArchivedGroupCleanup({getConnection,readState,refresh,lastMessage=()=>null,
+export function createArchivedGroupCleanup({getConnection,readState,refresh,
  clock=Date.now,wait=ms=>new Promise(r=>setTimeout(r,ms)),ttlMs=300000,spacingMs=1000}){
  let plan=null,busy=false,active=null,last={running:false,acceptedGroups:0};
  const eligible=(jid,current)=>groupId(jid) && current.members.has(jid) && current.archived.has(jid) &&
@@ -19,7 +19,9 @@ export function createArchivedGroupCleanup({getConnection,readState,refresh,last
  async function fresh(s){
   try{const current=await refresh(s);if(!(current?.members instanceof Set) || !(current?.archived instanceof Set))throw Error();
    if(connection()!==s)throw failure('CONNECTION_CHANGED');return current;
-  }catch(error){if(error?.code==='CONNECTION_CHANGED')throw error;throw failure('STATE_REFRESH_FAILED');}
+  }catch(error){if(error?.code==='CONNECTION_CHANGED')throw error;const e=failure('STATE_REFRESH_FAILED');
+   if(typeof error?.archiveReason==='string'&&/^[A-Z_]{1,48}$/.test(error.archiveReason))e.archiveReason=error.archiveReason;
+   throw e;}
  }
  async function preview(body={}){
   if(!exactObject(body,[]))throw failure('INVALID_REQUEST');
@@ -52,8 +54,7 @@ export function createArchivedGroupCleanup({getConnection,readState,refresh,last
      const jid=p.ids[i];
      if(!eligible(jid,members)){last.skippedGroups++;last.unattemptedGroups--;continue;}
      try{
-      const lm=lastMessage(jid);
-      await p.socket.chatModify({clear:true,lastMessages:lm?[lm]:{lastMessageTimestamp:p.cutoff,lastSystemMessageTimestamp:p.cutoff}},jid);
+      await p.socket.chatModify({clear:true,lastMessages:{lastMessageTimestamp:p.cutoff,lastSystemMessageTimestamp:p.cutoff}},jid);
       last.acceptedGroups++;last.unattemptedGroups--;
      }catch{last.failedGroups++;last.unattemptedGroups--;last.error='CLEAR_FAILED';break;}
     }
@@ -70,7 +71,7 @@ export function createArchivedGroupCleanup({getConnection,readState,refresh,last
 }
 
 export function mountArchivedGroupCleanup(app,secure,cleanup){
- const error=(res,e)=>res.status(e?.code==='INVALID_REQUEST'?400:e?.code==='OPERATION_BUSY'?409:412).json({error:e?.code||'CLEANUP_UNAVAILABLE'});
+ const error=(res,e)=>res.status(e?.code==='INVALID_REQUEST'?400:e?.code==='OPERATION_BUSY'?409:412).json({error:e?.code||'CLEANUP_UNAVAILABLE',...(e?.archiveReason?{reason:e.archiveReason}:{})});
  app.post('/crm/archived-groups/clear/preview',secure,async(req,res)=>{
   try{res.json({ok:true,...await cleanup.preview(req.body??{})});}catch(e){error(res,e);}
  });
