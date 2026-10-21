@@ -45,9 +45,9 @@ export function createArchivedGroupCleanup({getConnection,readState,refresh,
    cutoff:p.cutoff,scope:'archived_groups_only',verification:'server_ack_only',startedAt:new Date(clock()).toISOString()};
   active=(async()=>{
    try{
-    const members=await fresh(p.socket);
     for(let i=0;i<p.ids.length;i++){
      if(i)await wait(spacingMs);
+     const members=await fresh(p.socket);
      if(getConnection()!==p.socket)throw failure('CONNECTION_CHANGED');
      const jid=p.ids[i];
      if(!eligible(jid,members)){last.skippedGroups++;last.unattemptedGroups--;continue;}

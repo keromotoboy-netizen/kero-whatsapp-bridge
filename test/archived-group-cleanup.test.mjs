@@ -46,6 +46,11 @@ test('groups no longer participating are skipped',async()=>{
  const f=fixture(),p=await f.api.preview({});f.members.delete('100-1@g.us');
  const r=await f.api.execute({planId:p.planId,confirm});assert.equal(r.skippedGroups,1);assert.equal(f.calls.length,0);
 });
+test('each group requires its own fresh remote archive read',async()=>{
+ const f=fixture();f.state.chats['100-2@g.us'].archived=true;
+ const p=await f.api.preview({});await f.api.execute({planId:p.planId,confirm});
+ assert.equal(f.refreshCount,3);assert.equal(f.calls.length,2);
+});
 test('expired plans cannot delete',async()=>{
  const f=fixture(),p=await f.api.preview({});f.advance(300001);
  await assert.rejects(f.api.execute({planId:p.planId,confirm}),/PLAN_EXPIRED/);assert.equal(f.calls.length,0);
