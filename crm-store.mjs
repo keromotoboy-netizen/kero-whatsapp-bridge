@@ -348,6 +348,8 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
     if (ts >= previousLastTs) {
       chat.lastMessageTimestamp = ts;
       chat.lastMessage = item.text;
+      // só a chave (sem conteúdo): o WhatsApp precisa dela para aplicar "limpar conversa" no celular
+      chat.lastMessageKey = { id, remoteJid: jid, fromMe: !!raw.key.fromMe, ...(raw.key.participant ? { participant: raw.key.participant } : {}) };
     }
     if (raw.pushName && !chat.pushName) chat.pushName = raw.pushName;
     if (countUnread && idx < 0 && !item.fromMe) chat.unreadCount = Number(chat.unreadCount || 0) + 1;

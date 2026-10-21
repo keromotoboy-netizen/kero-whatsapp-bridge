@@ -10,7 +10,7 @@ function exactObject(value,keys){
 
 // Capabilities are deliberately limited: the only remote mutation is chatModify(clear).
 // Plans live in memory, have a fixed message cutoff and are consumed before any I/O.
-export function createArchivedGroupCleanup({getConnection,readState,refresh,
+export function createArchivedGroupCleanup({getConnection,readState,refresh,lastMessage=()=>null,
  clock=Date.now,wait=ms=>new Promise(r=>setTimeout(r,ms)),ttlMs=300000,spacingMs=1000}){
  let plan=null,busy=false,active=null,last={running:false,acceptedGroups:0};
  const eligible=(jid,current)=>groupId(jid) && current.members.has(jid) && current.archived.has(jid) &&
@@ -52,7 +52,8 @@ export function createArchivedGroupCleanup({getConnection,readState,refresh,
      const jid=p.ids[i];
      if(!eligible(jid,members)){last.skippedGroups++;last.unattemptedGroups--;continue;}
      try{
-      await p.socket.chatModify({clear:true,lastMessages:{lastMessageTimestamp:p.cutoff,lastSystemMessageTimestamp:p.cutoff}},jid);
+      const lm=lastMessage(jid);
+      await p.socket.chatModify({clear:true,lastMessages:lm?[lm]:{lastMessageTimestamp:p.cutoff,lastSystemMessageTimestamp:p.cutoff}},jid);
       last.acceptedGroups++;last.unattemptedGroups--;
      }catch{last.failedGroups++;last.unattemptedGroups--;last.error='CLEAR_FAILED';break;}
     }

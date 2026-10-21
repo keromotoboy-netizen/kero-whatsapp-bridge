@@ -71,7 +71,19 @@ function secure(req, res, next) {
 const archivedGroupCleanup=createArchivedGroupCleanup({
   getConnection:()=>status==='open'?sock:null,
   readState:()=>CRM.state,
-  refresh:connection=>readArchivedGroupState(connection,{extractSyncdPatches,decodeSyncdSnapshot,decodePatches,proto})
+  refresh:async connection=>{
+    try{return await readArchivedGroupState(connection,{extractSyncdPatches,decodeSyncdSnapshot,decodePatches,proto});}
+    catch(e){
+      // plano B (21/10/2026): o snapshot estrito recusa patches de remoção e falhava sempre (STATE_REFRESH_FAILED).
+      // Usa os grupos dos quais ainda é membro + arquivamento do CRM (mantido pelos eventos do WhatsApp).
+      console.warn('[archived-clear] snapshot recusado, usando estado do CRM:',e?.message||e);
+      const groups=await connection.groupFetchAllParticipating();
+      const archived=new Set(Object.entries(CRM.state.chats||{}).filter(([j,c])=>j.endsWith('@g.us')&&c?.archived===true).map(([j])=>j));
+      return {members:new Set(Object.keys(groups||{})),archived};
+    }
+  },
+  lastMessage:jid=>{const c=CRM.state.chats?.[jid];const k=c?.lastMessageKey,ts=Number(c?.lastMessageTimestamp||0);
+    return k?.id&&k.remoteJid===jid&&ts>0&&(k.fromMe||k.participant)?{key:k,messageTimestamp:ts}:null;}
 });
 mountArchivedGroupCleanup(app,secure,archivedGroupCleanup);
 
