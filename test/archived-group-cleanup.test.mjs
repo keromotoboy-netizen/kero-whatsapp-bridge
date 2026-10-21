@@ -92,11 +92,11 @@ test('concurrent execution is rejected and archive is rechecked after inter-grou
  f.state.chats['100-2@g.us'].archived=false;release();const r=await run;assert.equal(r.skippedGroups,1);assert.equal(f.calls.length,1);
 });
 
-test('clear uses the last known message key when available',async()=>{
+test('a last message newer than preview never expands its fixed deletion cutoff',async()=>{
  const state={chats:{'100-1@g.us':{id:'100-1@g.us',archived:true}}},calls=[],members=new Set(['100-1@g.us']);
  const socket={chatModify:async(mod,jid)=>calls.push({mod,jid})};
- const last={key:{id:'ABC',remoteJid:'100-1@g.us',fromMe:false,participant:'5511@s.whatsapp.net'},messageTimestamp:1999999000};
+ const last={key:{id:'ABC',remoteJid:'100-1@g.us',fromMe:false,participant:'100@s.whatsapp.net'},messageTimestamp:2000001000};
  const api=createArchivedGroupCleanup({getConnection:()=>socket,readState:()=>state,refresh:async()=>({members,archived:members}),lastMessage:j=>j==='100-1@g.us'?last:null,clock:()=>2000000000000,wait:async()=>{}});
  const p=await api.preview({});const r=await api.execute({planId:p.planId,confirm:'CLEAR_ARCHIVED_GROUP_MESSAGES_ONLY'});
- assert.equal(r.acceptedGroups,1);assert.deepEqual(calls,[{jid:'100-1@g.us',mod:{clear:true,lastMessages:[last]}}]);
+ assert.equal(r.acceptedGroups,1);assert.deepEqual(calls,[{jid:'100-1@g.us',mod:{clear:true,lastMessages:{lastMessageTimestamp:1999999999,lastSystemMessageTimestamp:1999999999}}}]);
 });
