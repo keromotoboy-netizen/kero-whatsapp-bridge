@@ -3,7 +3,8 @@ import makeWASocket, {
   downloadMediaMessage,
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
-  DisconnectReason
+  DisconnectReason,
+  extractSyncdPatches, decodeSyncdSnapshot, decodePatches, proto
 } from 'baileys';
 import QRCode from 'qrcode';
 import pino from 'pino';
@@ -16,6 +17,7 @@ import { createAiEngine } from './ai-engine.mjs';
 import { selectAuthDirectory } from './auth-directory.mjs';
 import { maintenanceMutationAllowed, scheduledMaintenanceAllowed } from './maintenance-permissions.mjs';
 import { createArchivedGroupCleanup, mountArchivedGroupCleanup } from './archived-group-cleanup.mjs';
+import { readArchivedGroupState } from './archive-state-reader.mjs';
 
 const app = express();
 app.use(express.json({ limit: '24mb' }));
@@ -69,11 +71,7 @@ function secure(req, res, next) {
 const archivedGroupCleanup=createArchivedGroupCleanup({
   getConnection:()=>status==='open'?sock:null,
   readState:()=>CRM.state,
-  refresh:async connection=>{
-    await connection.resyncAppState(['regular_low','regular_high'],false);
-    const groups=await connection.groupFetchAllParticipating();
-    return new Set(Object.keys(groups||{}));
-  }
+  refresh:connection=>readArchivedGroupState(connection,{extractSyncdPatches,decodeSyncdSnapshot,decodePatches,proto})
 });
 mountArchivedGroupCleanup(app,secure,archivedGroupCleanup);
 

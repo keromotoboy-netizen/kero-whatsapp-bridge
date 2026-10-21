@@ -13,12 +13,12 @@ function exactObject(value,keys){
 export function createArchivedGroupCleanup({getConnection,readState,refresh,
  clock=Date.now,wait=ms=>new Promise(r=>setTimeout(r,ms)),ttlMs=300000,spacingMs=1000}){
  let plan=null,busy=false,active=null,last={running:false,acceptedGroups:0};
- const eligible=(jid,members)=>groupId(jid) && members.has(jid) &&
+ const eligible=(jid,current)=>groupId(jid) && current.members.has(jid) && current.archived.has(jid) &&
  readState()?.chats?.[jid]?.id===jid && readState().chats[jid].archived===true;
  function connection(){const s=getConnection();if(!s)throw failure('WHATSAPP_NOT_CONNECTED');return s;}
  async function fresh(s){
-  try{const members=await refresh(s);if(!(members instanceof Set))throw Error();
-   if(connection()!==s)throw failure('CONNECTION_CHANGED');return members;
+  try{const current=await refresh(s);if(!(current?.members instanceof Set) || !(current?.archived instanceof Set))throw Error();
+   if(connection()!==s)throw failure('CONNECTION_CHANGED');return current;
   }catch(error){if(error?.code==='CONNECTION_CHANGED')throw error;throw failure('STATE_REFRESH_FAILED');}
  }
  async function preview(body={}){

@@ -9,10 +9,19 @@ function fixture(){
  const socket={chatModify:async(mod,jid)=>calls.push({mod,jid}),sendMessage:()=>{throw Error('Forbidden send');},groupLeave:()=>{throw Error('Forbidden leave');}};
  let current=socket,refreshCount=0;
  const members=new Set(['100-1@g.us','100-2@g.us','100-3@g.us','100-4@g.us']);
- const f={state,calls,socket,members,get refreshCount(){return refreshCount;},setSocket:x=>current=x,advance:n=>time+=n};
- f.api=createArchivedGroupCleanup({getConnection:()=>current,readState:()=>state,refresh:async()=>{refreshCount++;return members;},clock:()=>time,wait:async()=>{}});return f;
+ const archived=new Set(members);
+ const f={state,calls,socket,members,archived,get refreshCount(){return refreshCount;},setSocket:x=>current=x,advance:n=>time+=n};
+ f.api=createArchivedGroupCleanup({getConnection:()=>current,readState:()=>state,refresh:async()=>{refreshCount++;return {members,archived};},clock:()=>time,wait:async()=>{}});return f;
 }
 const confirm='CLEAR_ARCHIVED_GROUP_MESSAGES_ONLY';
+test('a stale CRM archived true cannot authorize clearing an unarchived server chat',async()=>{
+ const f=fixture();f.archived.clear();const p=await f.api.preview({});assert.equal(p.eligibleGroups,0);
+ await f.api.execute({planId:p.planId,confirm});assert.equal(f.calls.length,0);
+});
+test('server archive changing after preview excludes the group even if CRM stays true',async()=>{
+ const f=fixture(),p=await f.api.preview({});f.archived.clear();
+ const r=await f.api.execute({planId:p.planId,confirm});assert.equal(r.skippedGroups,1);assert.equal(f.calls.length,0);
+});
 test('preview excludes private, active and unknown archive states and is nonmutating',async()=>{
  const f=fixture(),before=JSON.stringify(f.state),p=await f.api.preview({});
  assert.equal(p.eligibleGroups,1);assert.equal(f.calls.length,0);assert.equal(JSON.stringify(f.state),before);

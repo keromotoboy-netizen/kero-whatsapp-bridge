@@ -7,14 +7,14 @@ import {createArchivedGroupCleanup,mountArchivedGroupCleanup} from '../archived-
 test('installed Baileys maps clear to bounded clearChat action, never deleteChat or labels',()=>{
  const patch=chatModificationToAppPatch({clear:true,lastMessages:{lastMessageTimestamp:1999999999,lastSystemMessageTimestamp:1999999999}},'100-1@g.us');
  assert.deepEqual(patch.index,['clearChat','100-1@g.us','1','0']);
- assert.deepEqual(Object.keys(patch.syncAction),['clearChatAction']);
+ assert.deepEqual(Object.keys(patch.syncAction).filter(k=>k!=='timestamp'),['clearChatAction']);
  assert.deepEqual(patch.syncAction.clearChatAction.messageRange,{lastMessageTimestamp:1999999999,lastSystemMessageTimestamp:1999999999});
 });
 
 test('HTTP requires authentication, preview and exact confirmation; status is aggregate only',async()=>{
  const calls=[],state={chats:{'100-1@g.us':{id:'100-1@g.us',archived:true},'100@s.whatsapp.net':{id:'100@s.whatsapp.net',archived:true}}};
  const socket={chatModify:async(mod,jid)=>calls.push({mod,jid})};
- const cleanup=createArchivedGroupCleanup({getConnection:()=>socket,readState:()=>state,refresh:async()=>new Set(['100-1@g.us']),wait:async()=>{}});
+ const cleanup=createArchivedGroupCleanup({getConnection:()=>socket,readState:()=>state,refresh:async()=>({members:new Set(['100-1@g.us']),archived:new Set(['100-1@g.us'])}),wait:async()=>{}});
  const app=express();app.use(express.json());
  mountArchivedGroupCleanup(app,(req,res,next)=>req.get('x-fixture-auth')==='allowed'?next():res.sendStatus(401),cleanup);
  const server=app.listen(0,'127.0.0.1');await new Promise(r=>server.once('listening',r));
