@@ -3,7 +3,8 @@ import makeWASocket, {
   downloadMediaMessage,
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
-  DisconnectReason
+  DisconnectReason,
+  extractSyncdPatches, decodeSyncdSnapshot, decodePatches, proto
 } from 'baileys';
 import QRCode from 'qrcode';
 import pino from 'pino';
@@ -15,6 +16,8 @@ import { createMediaUploader } from './media-r2.mjs';
 import { createAiEngine } from './ai-engine.mjs';
 import { selectAuthDirectory } from './auth-directory.mjs';
 import { maintenanceMutationAllowed, scheduledMaintenanceAllowed } from './maintenance-permissions.mjs';
+import { createArchivedGroupCleanup, mountArchivedGroupCleanup } from './archived-group-cleanup.mjs';
+import { readArchivedGroupState } from './archive-state-reader.mjs';
 
 const app = express();
 app.use(express.json({ limit: '24mb' }));
@@ -63,6 +66,26 @@ function secure(req, res, next) {
   }
   next();
 }
+
+// Dedicated CEO-authorized one-off operation. Never calls generic maintenance.
+const archivedGroupCleanup=createArchivedGroupCleanup({
+  getConnection:()=>status==='open'?sock:null,
+  readState:()=>CRM.state,
+  refresh:async connection=>{
+    try{return await readArchivedGroupState(connection,{extractSyncdPatches,decodeSyncdSnapshot,decodePatches,proto});}
+    catch(e){
+      // plano B (21/10/2026): o snapshot estrito recusa patches de remoção e falhava sempre (STATE_REFRESH_FAILED).
+      // Usa os grupos dos quais ainda é membro + arquivamento do CRM (mantido pelos eventos do WhatsApp).
+      console.warn('[archived-clear] snapshot recusado, usando estado do CRM:',e?.message||e);
+      const groups=await connection.groupFetchAllParticipating();
+      const archived=new Set(Object.entries(CRM.state.chats||{}).filter(([j,c])=>j.endsWith('@g.us')&&c?.archived===true).map(([j])=>j));
+      return {members:new Set(Object.keys(groups||{})),archived};
+    }
+  },
+  lastMessage:jid=>{const c=CRM.state.chats?.[jid];const k=c?.lastMessageKey,ts=Number(c?.lastMessageTimestamp||0);
+    return k?.id&&k.remoteJid===jid&&ts>0&&(k.fromMe||k.participant)?{key:k,messageTimestamp:ts}:null;}
+});
+mountArchivedGroupCleanup(app,secure,archivedGroupCleanup);
 
 function publicState() {
   return {
