@@ -15,6 +15,7 @@ import { createMediaUploader } from './media-r2.mjs';
 import { createAiEngine } from './ai-engine.mjs';
 import { selectAuthDirectory } from './auth-directory.mjs';
 import { maintenanceMutationAllowed, scheduledMaintenanceAllowed } from './maintenance-permissions.mjs';
+import { createArchivedGroupCleanup, mountArchivedGroupCleanup } from './archived-group-cleanup.mjs';
 
 const app = express();
 app.use(express.json({ limit: '24mb' }));
@@ -63,6 +64,18 @@ function secure(req, res, next) {
   }
   next();
 }
+
+// Dedicated CEO-authorized one-off operation. Never calls generic maintenance.
+const archivedGroupCleanup=createArchivedGroupCleanup({
+  getConnection:()=>status==='open'?sock:null,
+  readState:()=>CRM.state,
+  refresh:async connection=>{
+    await connection.resyncAppState(['regular_low','regular_high'],false);
+    const groups=await connection.groupFetchAllParticipating();
+    return new Set(Object.keys(groups||{}));
+  }
+});
+mountArchivedGroupCleanup(app,secure,archivedGroupCleanup);
 
 function publicState() {
   return {
