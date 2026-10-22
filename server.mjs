@@ -485,6 +485,20 @@ app.post('/crm/presence', secure, async (req, res) => {
   }
 });
 
+// KERO 21/10/2026: "digitando..." imediato para o atendente (sem passar pela fila).
+app.post('/crm/typing', secure, async (req, res) => {
+  const jid = String(req.body?.jid || '');
+  const state = req.body?.state === 'paused' ? 'paused' : 'composing';
+  if (!jid) return res.status(400).json({ error: 'missing_jid' });
+  if (!sock || status !== 'open') return res.status(409).json({ error: 'whatsapp_not_connected' });
+  try {
+    await sock.sendPresenceUpdate(state, await resolveOutboundJid(jid));
+    res.json({ ok: true, state });
+  } catch (error) {
+    res.status(502).json({ error: 'presence_update_failed', message: error?.message || String(error) });
+  }
+});
+
 app.post('/crm/resync', secure, async (_req, res) => {
   if (!sock || status !== 'open') return res.status(409).json({ error: 'whatsapp_not_connected' });
   const collections = ['critical_unblock_low','regular_high','regular_low','critical_block','regular'];
