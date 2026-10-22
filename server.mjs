@@ -676,6 +676,7 @@ setInterval(async ()=>{
 // Opt-in: WA_OUTBOX_ENABLED=1 + SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY + WA_OUTBOX_ALLOWED_JIDS (lista separada por vírgula).
 // KERO 18/10/2026: KERO_QUEUE_URL + KERO_QUEUE_TOKEN trocam a fila para o Cloudflare (sem eles, segue Supabase).
 const outboxOnCloudflare = !!(process.env.KERO_QUEUE_URL && process.env.KERO_QUEUE_TOKEN);
+const OUTBOX_TYPING = '__kero_digitando__';
 if (process.env.WA_OUTBOX_ENABLED === '1' && (outboxOnCloudflare || (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY))) {
   const outbox = createOutboxWorker({
     supabaseUrl: process.env.SUPABASE_URL,
@@ -689,8 +690,14 @@ if (process.env.WA_OUTBOX_ENABLED === '1' && (outboxOnCloudflare || (process.env
       if (!sock || status !== 'open') throw new Error('whatsapp_not_connected');
       const targetJid = await resolveOutboundJid(jid);
       if (jid.endsWith('@lid') && targetJid === jid) throw new Error('contact_number_still_syncing');
+      // KERO 21/10/2026: linha especial da fila = mostrar "digitando..." enquanto o atendente prepara a resposta.
+      if (text === OUTBOX_TYPING) {
+        await sock.sendPresenceUpdate('composing', targetJid);
+        return { messageId: 'presence:composing' };
+      }
       const sent = await sock.sendMessage(targetJid, { text });
       if (sent) CRM.upsertMessage(sent);
+      await sock.sendPresenceUpdate('paused', targetJid).catch(() => null);
       return { messageId: sent?.key?.id || null };
     }
   });
