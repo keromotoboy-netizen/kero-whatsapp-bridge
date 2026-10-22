@@ -499,6 +499,23 @@ app.post('/crm/typing', secure, async (req, res) => {
   }
 });
 
+// KERO 22/10/2026: reacao com emoji na mensagem do cliente (a equipe ve que a IA leu). emoji vazio remove a reacao.
+app.post('/crm/react', secure, async (req, res) => {
+  const jid = String(req.body?.jid || '');
+  const id = String(req.body?.id || '');
+  const emoji = String(req.body?.emoji ?? '❤️').slice(0, 8);
+  if (!jid || !id) return res.status(400).json({ error: 'jid_and_id_required' });
+  if (!sock || status !== 'open') return res.status(409).json({ error: 'whatsapp_not_connected' });
+  try {
+    const targetJid = await resolveOutboundJid(jid);
+    const key = { remoteJid: targetJid, id, fromMe: !!req.body?.fromMe, ...(req.body?.participant ? { participant: String(req.body.participant) } : {}) };
+    await sock.sendMessage(targetJid, { react: { text: emoji, key } });
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(502).json({ error: 'react_failed', message: error?.message || String(error) });
+  }
+});
+
 app.post('/crm/resync', secure, async (_req, res) => {
   if (!sock || status !== 'open') return res.status(409).json({ error: 'whatsapp_not_connected' });
   const collections = ['critical_unblock_low','regular_high','regular_low','critical_block','regular'];
