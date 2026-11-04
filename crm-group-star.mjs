@@ -17,8 +17,13 @@ export function mountCrmGroupStar(app, secure, { getSocket, isConnected, crm }) 
     return { jid, id, msg };
   }
   function status(key) {
-    return { ok: true, operation: 'star', starred: key.msg.starred === true,
-      confirmed: key.msg.starred === true, requested: !!key.msg.starRequestedAt };
+    // Only an observed, durably saved WhatsApp state update proves a star.
+    const confirmed = key.msg.starred === true && !!key.msg.starObservedAt && key.msg.starReceiptDurable === true;
+    const requested = !!key.msg.starRequestedAt;
+    return { ok: true, operation: 'star', requested,
+      accepted: !!key.msg.starCommandAckAt, starred: confirmed, confirmed,
+      outcome: confirmed ? 'CONFIRMED' : key.msg.starOutcomeUnknownAt || (key.msg.starred && !key.msg.starObservedAt) ? 'UNKNOWN' : requested ? 'PENDING' : 'NOT_REQUESTED',
+      confirmationSource: confirmed ? 'messages.update:starred' : null };
   }
   app.post('/crm/star-status', secure, async (req, res) => {
     const key = inspect(req, res);
@@ -28,7 +33,8 @@ export function mountCrmGroupStar(app, secure, { getSocket, isConnected, crm }) 
     const key = inspect(req, res);
     if (!key) return;
     if (key.msg.deleted) return res.status(409).json({ ok: false, error: 'message_already_deleted' });
-    if (key.msg.starred === true) return res.json({ ...status(key), duplicateSuppressed: true });
+    if (status(key).confirmed) return res.json({ ...status(key), duplicateSuppressed: true });
+    if (key.msg.starred === true && !key.msg.starObservedAt) return res.status(202).json({ ...status(key), duplicateSuppressed: true });
     if (key.msg.starRequestedAt) return res.status(202).json({ ...status(key), duplicateSuppressed: true });
     if (!isConnected() || !getSocket()) return res.status(409).json({ ok: false, error: 'whatsapp_not_connected' });
     // Durable reservation before external mutation. Never retry on uncertain timeout.
@@ -40,13 +46,14 @@ export function mountCrmGroupStar(app, secure, { getSocket, isConnected, crm }) 
     }
     try {
       await getSocket().chatModify({ star: { messages: [{ id: key.id, fromMe: true }], star: true } }, key.jid);
-      key.msg.starred = true;
-      key.msg.starAppliedAt = Date.now();
+      key.msg.starCommandAckAt = Date.now();
       await crm.saveNow(true);
-      return res.json({ ...status(key), confirmation: 'baileys_chatModify_resolved' });
+      const state = status(key);
+      return res.status(state.confirmed ? 200 : 202).json({ ...state, confirmation: 'baileys_command_accepted_not_star_proof' });
     } catch {
-      return res.status(502).json({ ok: false, operation: 'star', error: 'star_outcome_unconfirmed',
-        requested: true, starred: key.msg.starred === true, confirmed: false });
+      key.msg.starOutcomeUnknownAt = Date.now();
+      try { await crm.saveNow(true); } catch {}
+      return res.status(502).json({ ...status(key), ok: false, error: 'star_outcome_unconfirmed' });
     }
   });
 }

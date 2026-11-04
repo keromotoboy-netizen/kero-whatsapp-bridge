@@ -17,13 +17,16 @@ export function mountCrmGroupDelete(app, secure, { getSocket, isConnected, crm }
     return { jid, id, msg };
   }
   function status(key) {
+    // A Baileys sendMessage return is not a server-side revoke event.
+    const confirmed = key.msg.deletedForEveryone === true &&
+      !!key.msg.deleteConfirmedAt && key.msg.deleteReceiptDurable === true;
+    const requested = !!key.msg.deleteRequestedAt;
     return {
-      ok: true,
-      operation: 'delete',
-      requested: !!key.msg.deleteRequestedAt,
-      // A returned result from Baileys sendMessage is NOT proof of deletion for everyone.
-      confirmed: key.msg.deletedForEveryone === true,
-      deleted: key.msg.deletedForEveryone === true
+      ok: true, operation: 'delete', requested,
+      accepted: !!key.msg.deleteCommandAckAt,
+      confirmed, deleted: confirmed,
+      outcome: confirmed ? 'CONFIRMED' : key.msg.deleteOutcomeUnknownAt ? 'UNKNOWN' : requested ? 'PENDING' : 'NOT_REQUESTED',
+      confirmationSource: confirmed ? 'messages.update:REVOKE' : null
     };
   }
   app.post('/crm/delete-status', secure, async (req, res) => {
@@ -34,7 +37,8 @@ export function mountCrmGroupDelete(app, secure, { getSocket, isConnected, crm }
     const key = inspect(req, res);
     if (!key) return;
     if (key.msg.deletedForEveryone === true) {
-      return res.json({ ...status(key), duplicateSuppressed: true });
+      const state = status(key);
+      return res.status(state.confirmed ? 200 : 202).json({ ...state, duplicateSuppressed: true });
     }
     if (key.msg.deleted === true) {
       return res.status(409).json({ ok: false, error: 'message_deleted_without_for_everyone_ack', noAction: true });
@@ -61,8 +65,9 @@ export function mountCrmGroupDelete(app, secure, { getSocket, isConnected, crm }
       const state = status(key);
       return res.status(state.confirmed ? 200 : 202).json(state);
     } catch {
-      return res.status(502).json({ ok: false, operation: 'delete',
-        error: 'delete_outcome_unconfirmed', requested: true, confirmed: false, deleted: false });
+      key.msg.deleteOutcomeUnknownAt = Date.now();
+      try { await crm.saveNow(true); } catch {}
+      return res.status(502).json({ ...status(key), ok: false, error: 'delete_outcome_unconfirmed' });
     }
   });
 }
