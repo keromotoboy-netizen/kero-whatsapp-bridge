@@ -9,6 +9,7 @@ import makeWASocket, {
 import QRCode from 'qrcode';
 import pino from 'pino';
 import fs from 'node:fs';
+import { createHmac } from 'node:crypto';
 import { createCrmStore } from './crm-store.mjs';
 import { createOutboxWorker, parseAllowedJids } from './outbox-worker.mjs';
 import { createD1Mirror } from './d1-mirror.mjs';
@@ -48,6 +49,44 @@ if (d1Mirror) {
   console.log('[d1-mirror] ligado');
 }
 
+// KERO-MEDIA-IDEMPOTENCY-20261104-V1: outbound image deduplication, persisted on existing auth volume.
+// No image bytes, caption or recipient JID are stored. Independent of the temporary photo pause.
+const IMAGE_SEND_DEDUP_TTL_MS = 24 * 60 * 60 * 1000;
+const IMAGE_SEND_DEDUP_PATH = DATA_DIR + '/kero-image-send-dedup-v1.json';
+const imageSendDedup = new Map();
+let imageSendDedupReady = true;
+try {
+  const saved = JSON.parse(fs.readFileSync(IMAGE_SEND_DEDUP_PATH, 'utf8'));
+  if (!Array.isArray(saved)) throw Error('dedup_store_shape');
+  for (const [key, value] of saved) {
+    if (!/^[0-9a-f]{64}$/.test(key) || !value || !['pending','sent'].includes(value.state)
+        || !Number.isSafeInteger(value.expiresAt)) throw Error('dedup_store_record');
+    if (value.expiresAt > Date.now()) imageSendDedup.set(key, value);
+  }
+} catch (error) {
+  if (error?.code !== 'ENOENT') {
+    imageSendDedupReady = false;
+    console.error('[media-dedup] storage not readable; image sending disabled', error?.code || 'invalid_data');
+  }
+}
+function saveImageSendDedup() {
+  const now = Date.now();
+  for (const [key, value] of imageSendDedup) {
+    if (value.expiresAt <= now) imageSendDedup.delete(key);
+  }
+  if (imageSendDedup.size > 20000) throw Error('dedup_capacity');
+  const tmp = IMAGE_SEND_DEDUP_PATH + '.' + process.pid + '.tmp';
+  try {
+    fs.writeFileSync(tmp, JSON.stringify([...imageSendDedup]), { flag: 'wx', mode: 0o600 });
+    fs.renameSync(tmp, IMAGE_SEND_DEDUP_PATH);
+  } catch (error) {
+    try { fs.unlinkSync(tmp); } catch {}
+    throw error;
+  }
+}
+function imageSendDedupKey(targetJid, buffer) {
+  return createHmac('sha256', API_SECRET).update(targetJid).update('\0').update(buffer).digest('hex');
+}
 let sock = null;
 let status = 'idle';
 let latestQr = null;
@@ -450,7 +489,40 @@ app.post('/crm/send-media', secure, async (req, res) => {
     if (jid.endsWith('@lid') && targetJid === jid) {
       return res.status(409).json({ error: 'contact_number_still_syncing' });
     }
+    let dedupKey = null;
+    if (kind === 'image') {
+      if (!imageSendDedupReady) return res.status(503).json({ error: 'image_dedup_unavailable' });
+      dedupKey = imageSendDedupKey(targetJid, buffer);
+      const prev = imageSendDedup.get(dedupKey);
+      if (prev && prev.expiresAt > Date.now()) {
+        if (prev.state === 'pending') {
+          return res.status(409).json({ error: 'image_delivery_uncertain', duplicate: true });
+        }
+        return res.json({ ok: true, duplicate: true, suppressed: 'image_already_sent',
+          messageId: prev.messageId || null, resolved: targetJid !== jid });
+      }
+      imageSendDedup.set(dedupKey, { state: 'pending',
+        expiresAt: Date.now() + IMAGE_SEND_DEDUP_TTL_MS, messageId: null });
+      try {
+        saveImageSendDedup(); // fail closed before any WhatsApp image send
+      } catch (error) {
+        imageSendDedupReady = false;
+        console.error('[media-dedup] unable to persist reservation', error?.code || 'storage_error');
+        return res.status(503).json({ error: 'image_dedup_unavailable' });
+      }
+    }
     const sent = await sock.sendMessage(targetJid, content);
+    if (dedupKey) {
+      if (!sent?.key?.id) throw Error('media_delivery_uncertain');
+      imageSendDedup.set(dedupKey, { state: 'sent',
+        expiresAt: Date.now() + IMAGE_SEND_DEDUP_TTL_MS, messageId: sent.key.id });
+      try { saveImageSendDedup(); }
+      catch (error) {
+        imageSendDedupReady = false;
+        console.error('[media-dedup] post-send persistence failed; next images blocked',
+          error?.code || 'storage_error');
+      }
+    }
     if (sent) CRM.upsertMessage(sent);
     res.json({ ok: true, messageId: sent?.key?.id || null, resolved: targetJid !== jid });
   } catch (error) {
