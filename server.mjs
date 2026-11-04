@@ -21,6 +21,7 @@ import { maintenanceMutationAllowed, scheduledMaintenanceAllowed } from './maint
 import { mountArchivedGroupCleanup } from './archived-group-cleanup.mjs';
 import { createCrmArchivedCleanup } from './archived-cleanup-service.mjs';
 import { mountCrmGroupStar } from './crm-group-star.mjs';
+import { mountCrmGroupDelete } from './crm-group-delete.mjs';
 
 
 // KERO-CEO-PAUSE-UNTIL-ORDER-20261104-v1: no timer or automatic release.
@@ -472,6 +473,14 @@ app.post('/crm/send', secure, async (req, res) => {
 // Manual favorites: each sent group message is starred by its own messageId.
 // No publishing, deleting, reactions, photos or background scheduler here.
 mountCrmGroupStar(app, secure, {
+  getSocket: () => sock,
+  isConnected: () => status === 'open',
+  crm: CRM
+});
+
+// Manual delete-for-everyone, scoped to existing own group messages only.
+// Result is PENDING until a WhatsApp revoke event is observed; no retry.
+mountCrmGroupDelete(app, secure, {
   getSocket: () => sock,
   isConnected: () => status === 'open',
   crm: CRM
