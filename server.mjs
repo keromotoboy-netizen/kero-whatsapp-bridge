@@ -506,6 +506,10 @@ app.post('/crm/react', secure, async (req, res) => {
   const emoji = String(req.body?.emoji ?? '❤️').slice(0, 8);
   if (!jid || !id) return res.status(400).json({ error: 'jid_and_id_required' });
   if (!sock || status !== 'open') return res.status(409).json({ error: 'whatsapp_not_connected' });
+  // KERO-REACTIONS-PAUSE-20261104-V1: temporary CEO pause, auto-expires at 18h BRT on 06/11.
+  if (Date.now() < Date.parse('2026-11-06T21:00:00.000Z')) {
+    return res.json({ ok: true, reacted: false, suppressed: 'ceo_temporary_reaction_pause', resumes_at: '2026-11-06T21:00:00.000Z' });
+  }
   try {
     const targetJid = await resolveOutboundJid(jid);
     const key = { remoteJid: targetJid, id, fromMe: !!req.body?.fromMe, ...(req.body?.participant ? { participant: String(req.body.participant) } : {}) };
