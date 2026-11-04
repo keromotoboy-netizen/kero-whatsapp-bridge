@@ -172,13 +172,14 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
     if (trimmed) console.log('[crm] enxuto: mensagens antigas so no D1 =' + trimmed);
   }
 
-  const saveNow = () => {
+  const saveNow = (strict = false) => {
     try {
       state.updatedAt = Date.now();
       fs.writeFileSync(file + '.tmp', JSON.stringify(state));
       fs.renameSync(file + '.tmp', file);
     } catch (error) {
       console.error('[crm] failed to save state', error?.message || error);
+      if (strict) throw error;
     }
   };
 
@@ -401,6 +402,12 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
 
       // WhatsApp can report SERVER_ACK(1), DELIVERY_ACK(2), READ(3), PLAYED(4)
       // asynchronously. Only store monotonic numeric status; never log message data.
+      // Baileys app-state sync for a star/unstar action on one message.
+      if (item && typeof update.starred === 'boolean' && item.starred !== update.starred) {
+        item.starred = update.starred;
+        item.starUpdatedAt = Date.now();
+        changed = true;
+      }
       if (item && Number.isInteger(update.status) && update.status >= 0 && update.status <= 4) {
         const previous = Number.isInteger(item.deliveryStatus) ? item.deliveryStatus : -1;
         if (update.status > previous) {

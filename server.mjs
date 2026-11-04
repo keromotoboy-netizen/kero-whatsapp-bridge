@@ -20,6 +20,7 @@ import { selectAuthDirectory } from './auth-directory.mjs';
 import { maintenanceMutationAllowed, scheduledMaintenanceAllowed } from './maintenance-permissions.mjs';
 import { mountArchivedGroupCleanup } from './archived-group-cleanup.mjs';
 import { createCrmArchivedCleanup } from './archived-cleanup-service.mjs';
+import { mountCrmGroupStar } from './crm-group-star.mjs';
 
 
 // KERO-CEO-PAUSE-UNTIL-ORDER-20261104-v1: no timer or automatic release.
@@ -466,6 +467,14 @@ app.post('/crm/send', secure, async (req, res) => {
       error: error?.message || 'whatsapp_send_failed'
     });
   }
+});
+
+// Manual favorites: each sent group message is starred by its own messageId.
+// No publishing, deleting, reactions, photos or background scheduler here.
+mountCrmGroupStar(app, secure, {
+  getSocket: () => sock,
+  isConnected: () => status === 'open',
+  crm: CRM
 });
 
 app.post('/crm/send-media', secure, async (req, res) => {
