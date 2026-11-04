@@ -10,6 +10,7 @@ import QRCode from 'qrcode';
 import pino from 'pino';
 import fs from 'node:fs';
 import { createHmac } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
 import { createCrmStore } from './crm-store.mjs';
 import { createOutboxWorker, parseAllowedJids } from './outbox-worker.mjs';
 import { createD1Mirror } from './d1-mirror.mjs';
@@ -49,40 +50,39 @@ if (d1Mirror) {
   console.log('[d1-mirror] ligado');
 }
 
-// KERO-MEDIA-IDEMPOTENCY-20261104-V1: outbound image deduplication, persisted on existing auth volume.
-// No image bytes, caption or recipient JID are stored. Independent of the temporary photo pause.
-const IMAGE_SEND_DEDUP_TTL_MS = 24 * 60 * 60 * 1000;
-const IMAGE_SEND_DEDUP_PATH = DATA_DIR + '/kero-image-send-dedup-v1.json';
-const imageSendDedup = new Map();
+// KERO-MEDIA-IDEMPOTENCY-20261104-V2: permanent per-recipient image history.
+// SQLite is on the pre-existing auth volume; no image bytes or destination JIDs in the database.
+// This never expires entries. Unsafe or uncertain delivery fails closed.
+const IMAGE_SEND_DEDUP_PATH = DATA_DIR + '/kero-image-send-dedup-v2.sqlite';
+const IMAGE_SEND_DEDUP_LEGACY = DATA_DIR + '/kero-image-send-dedup-v1.json';
 let imageSendDedupReady = true;
+let imageSendDedupDb = null;
+let imageDedupSelect, imageDedupInsert, imageDedupConfirm;
 try {
-  const saved = JSON.parse(fs.readFileSync(IMAGE_SEND_DEDUP_PATH, 'utf8'));
-  if (!Array.isArray(saved)) throw Error('dedup_store_shape');
-  for (const [key, value] of saved) {
-    if (!/^[0-9a-f]{64}$/.test(key) || !value || !['pending','sent'].includes(value.state)
-        || !Number.isSafeInteger(value.expiresAt)) throw Error('dedup_store_record');
-    if (value.expiresAt > Date.now()) imageSendDedup.set(key, value);
+  imageSendDedupDb = new DatabaseSync(IMAGE_SEND_DEDUP_PATH);
+  imageSendDedupDb.exec('PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
+  imageSendDedupDb.exec("CREATE TABLE IF NOT EXISTS image_history (fingerprint TEXT PRIMARY KEY CHECK(length(fingerprint)=64), state TEXT NOT NULL CHECK(state IN ('pending','sent')), message_id TEXT, first_seen_ms INTEGER NOT NULL) STRICT;");
+  fs.chmodSync(IMAGE_SEND_DEDUP_PATH, 0o600);
+  imageDedupSelect = imageSendDedupDb.prepare('SELECT state, message_id FROM image_history WHERE fingerprint=?');
+  imageDedupInsert = imageSendDedupDb.prepare("INSERT OR IGNORE INTO image_history(fingerprint,state,message_id,first_seen_ms) VALUES (?,'pending',NULL,?)");
+  imageDedupConfirm = imageSendDedupDb.prepare("UPDATE image_history SET state='sent', message_id=? WHERE fingerprint=? AND state='pending'");
+  // Retain ALL V1 entries, including those whose 24h TTL has passed; never prune prior receipts.
+  if (fs.existsSync(IMAGE_SEND_DEDUP_LEGACY)) {
+    const saved = JSON.parse(fs.readFileSync(IMAGE_SEND_DEDUP_LEGACY, 'utf8'));
+    if (!Array.isArray(saved)) throw Error('legacy_dedup_store_shape');
+    imageSendDedupDb.exec('BEGIN IMMEDIATE');
+    try {
+      const migrate = imageSendDedupDb.prepare('INSERT OR IGNORE INTO image_history(fingerprint,state,message_id,first_seen_ms) VALUES (?,?,?,?)');
+      for (const [key, value] of saved) {
+        if (!/^[0-9a-f]{64}$/.test(key) || !value || !['pending','sent'].includes(value.state)) throw Error('legacy_dedup_entry_invalid');
+        migrate.run(key, value.state, value.messageId || null, Number.isSafeInteger(value.expiresAt) ? value.expiresAt - 86400000 : Date.now());
+      }
+      imageSendDedupDb.exec('COMMIT');
+    } catch (error) { imageSendDedupDb.exec('ROLLBACK'); throw error; }
   }
 } catch (error) {
-  if (error?.code !== 'ENOENT') {
-    imageSendDedupReady = false;
-    console.error('[media-dedup] storage not readable; image sending disabled', error?.code || 'invalid_data');
-  }
-}
-function saveImageSendDedup() {
-  const now = Date.now();
-  for (const [key, value] of imageSendDedup) {
-    if (value.expiresAt <= now) imageSendDedup.delete(key);
-  }
-  if (imageSendDedup.size > 20000) throw Error('dedup_capacity');
-  const tmp = IMAGE_SEND_DEDUP_PATH + '.' + process.pid + '.tmp';
-  try {
-    fs.writeFileSync(tmp, JSON.stringify([...imageSendDedup]), { flag: 'wx', mode: 0o600 });
-    fs.renameSync(tmp, IMAGE_SEND_DEDUP_PATH);
-  } catch (error) {
-    try { fs.unlinkSync(tmp); } catch {}
-    throw error;
-  }
+  imageSendDedupReady = false;
+  console.error('[media-dedup] permanent store unavailable; image sends disabled', error?.code || error?.message || 'invalid_data');
 }
 function imageSendDedupKey(targetJid, buffer) {
   return createHmac('sha256', API_SECRET).update(targetJid).update('\0').update(buffer).digest('hex');
@@ -493,33 +493,30 @@ app.post('/crm/send-media', secure, async (req, res) => {
     if (kind === 'image') {
       if (!imageSendDedupReady) return res.status(503).json({ error: 'image_dedup_unavailable' });
       dedupKey = imageSendDedupKey(targetJid, buffer);
-      const prev = imageSendDedup.get(dedupKey);
-      if (prev && prev.expiresAt > Date.now()) {
-        if (prev.state === 'pending') {
-          return res.status(409).json({ error: 'image_delivery_uncertain', duplicate: true });
-        }
-        return res.json({ ok: true, duplicate: true, suppressed: 'image_already_sent',
-          messageId: prev.messageId || null, resolved: targetJid !== jid });
-      }
-      imageSendDedup.set(dedupKey, { state: 'pending',
-        expiresAt: Date.now() + IMAGE_SEND_DEDUP_TTL_MS, messageId: null });
       try {
-        saveImageSendDedup(); // fail closed before any WhatsApp image send
+        const reservation = imageDedupInsert.run(dedupKey, Date.now());
+        if (reservation.changes === 0) {
+          const prev = imageDedupSelect.get(dedupKey);
+          if (!prev || prev.state === 'pending')
+            return res.status(409).json({ error: 'image_delivery_uncertain', duplicate: true });
+          return res.json({ ok: true, duplicate: true, suppressed: 'image_already_sent',
+            messageId: prev.message_id || null, resolved: targetJid !== jid });
+        }
       } catch (error) {
         imageSendDedupReady = false;
-        console.error('[media-dedup] unable to persist reservation', error?.code || 'storage_error');
+        console.error('[media-dedup] permanent reservation failed', error?.code || 'storage_error');
         return res.status(503).json({ error: 'image_dedup_unavailable' });
       }
     }
     const sent = await sock.sendMessage(targetJid, content);
     if (dedupKey) {
       if (!sent?.key?.id) throw Error('media_delivery_uncertain');
-      imageSendDedup.set(dedupKey, { state: 'sent',
-        expiresAt: Date.now() + IMAGE_SEND_DEDUP_TTL_MS, messageId: sent.key.id });
-      try { saveImageSendDedup(); }
-      catch (error) {
+      try {
+        const receipt = imageDedupConfirm.run(sent.key.id, dedupKey);
+        if (receipt.changes !== 1) throw Error('receipt_update_missing');
+      } catch (error) {
         imageSendDedupReady = false;
-        console.error('[media-dedup] post-send persistence failed; next images blocked',
+        console.error('[media-dedup] post-send receipt failed; next images blocked',
           error?.code || 'storage_error');
       }
     }
