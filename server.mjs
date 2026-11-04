@@ -21,6 +21,14 @@ import { maintenanceMutationAllowed, scheduledMaintenanceAllowed } from './maint
 import { mountArchivedGroupCleanup } from './archived-group-cleanup.mjs';
 import { createCrmArchivedCleanup } from './archived-cleanup-service.mjs';
 
+
+// KERO-CEO-PAUSE-UNTIL-ORDER-20261104-v1: no timer or automatic release.
+export function ceoPauseDecision(action, body = {}) {
+  if(action==='react')return {ok:false,error:'ceo_pause_until_further_order',suppressed:'ceo_indefinite_reaction_pause',reacted:false,resumes_at:null,resume_requires:'explicit_ceo_order'};
+  if(action==='send-media' && (/^(image|video)$/i.test(String(body.kind||'')) || /^(image|video)\//i.test(String(body.mimetype||''))))return {ok:false,error:'ceo_pause_until_further_order',pulado:'ceo-indefinite-photo-pause',photoBlocked:true,resumes_at:null,resume_requires:'explicit_ceo_order'};
+  return null;
+}
+
 const app = express();
 app.use(express.json({ limit: '24mb' }));
 
@@ -461,6 +469,8 @@ app.post('/crm/send', secure, async (req, res) => {
 });
 
 app.post('/crm/send-media', secure, async (req, res) => {
+  const ceoPause = ceoPauseDecision('send-media', req.body);
+  if (ceoPause) return res.status(423).json(ceoPause);
   const jid = String(req.body?.jid || '');
   const kind = String(req.body?.kind || '');
   const dataBase64 = String(req.body?.dataBase64 || '');
@@ -570,15 +580,13 @@ app.post('/crm/typing', secure, async (req, res) => {
 
 // KERO 22/10/2026: reacao com emoji na mensagem do cliente (a equipe ve que a IA leu). emoji vazio remove a reacao.
 app.post('/crm/react', secure, async (req, res) => {
+  const ceoPause = ceoPauseDecision('react', req.body);
+  if (ceoPause) return res.status(423).json(ceoPause);
   const jid = String(req.body?.jid || '');
   const id = String(req.body?.id || '');
   const emoji = String(req.body?.emoji ?? '❤️').slice(0, 8);
   if (!jid || !id) return res.status(400).json({ error: 'jid_and_id_required' });
   if (!sock || status !== 'open') return res.status(409).json({ error: 'whatsapp_not_connected' });
-  // KERO-REACTIONS-PAUSE-20261104-V1: temporary CEO pause, auto-expires at 18h BRT on 06/11.
-  if (Date.now() < Date.parse('2026-11-06T21:00:00.000Z')) {
-    return res.json({ ok: true, reacted: false, suppressed: 'ceo_temporary_reaction_pause', resumes_at: '2026-11-06T21:00:00.000Z' });
-  }
   try {
     const targetJid = await resolveOutboundJid(jid);
     const key = { remoteJid: targetJid, id, fromMe: !!req.body?.fromMe, ...(req.body?.participant ? { participant: String(req.body.participant) } : {}) };
