@@ -661,10 +661,17 @@ app.post('/crm/delete', secure, async (req, res) => {
   try {
     const targetJid = await resolveOutboundJid(jid);
     const sent = await sock.sendMessage(targetJid, { delete: { remoteJid: targetJid, id, fromMe: true } });
+    CRM.marcarKeroSentApagada(targetJid, id);
     res.json({ ok: true, deleted: id, revokeId: sent?.key?.id || null });
   } catch (error) {
     res.status(502).json({ error: 'delete_failed', message: error?.message || String(error) });
   }
+});
+
+// KERO-ROBO-VARREDURA-20261105: SO LEITURA. Mensagens enviadas pela Kero em grupos (inclusive arquivados e do celular),
+// ultimas N horas (max 62). Usada pelo robo independente de varredura de O.S. Nao guarda nem devolve mensagem de terceiros.
+app.get('/crm/kero-sent', secure, (req, res) => {
+  res.json({ ok: true, ...CRM.keroSent({ sinceHours: Number(req.query.sinceHours || 58) }) });
 });
 // Favoritar (estrela) uma mensagem: dupla seguranca para a equipe achar e apagar pelos Favoritos.
 app.post('/crm/star', secure, async (req, res) => {
