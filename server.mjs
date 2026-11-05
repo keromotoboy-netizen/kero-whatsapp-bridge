@@ -183,9 +183,40 @@ async function sendCrmText(jid, text) {
     throw new Error('contact_number_still_syncing');
   }
 
-  const sent = await sock.sendMessage(targetJid, { text: message });
-  if (sent) CRM.upsertMessage(sent);
-  return { ok: true, messageId: sent?.key?.id || null, resolved: targetJid !== value };
+  // Group sends must not report a usable receipt until its exact group+id is on disk.
+  // This is AFTER the external effect; any uncertainty must never trigger a blind resend.
+  const group = targetJid.endsWith('@g.us');
+  let sent;
+  try {
+    sent = await sock.sendMessage(targetJid, { text: message });
+  } catch (error) {
+    if (!group) throw error; // Preserve existing private/commercial send behavior.
+    return { ok: false, messageId: null, resolved: targetJid !== value,
+      outcome: 'UNKNOWN', retry: false, error: 'group_send_ack_unknown' };
+  }
+  if (!group) {
+    if (sent) CRM.upsertMessage(sent);
+    return { ok: true, messageId: sent?.key?.id || null, resolved: targetJid !== value };
+  }
+  const id = typeof sent?.key?.id === 'string' && sent.key.id.length >= 8 ? sent.key.id : null;
+  // Never associate a receipt with the wrong group or an incoming/non-owned message.
+  if (!id || sent?.key?.remoteJid !== targetJid || sent?.key?.fromMe !== true) {
+    return { ok: false, messageId: id, resolved: targetJid !== value,
+      outcome: 'UNKNOWN', retry: false, error: 'group_send_reference_unknown' };
+  }
+  try {
+    CRM.upsertMessage(sent);
+    const recorded = CRM.state?.messages?.[targetJid]?.some(
+      m => m?.id === id && m?.fromMe === true && m?.jid === targetJid);
+    if (!recorded) throw new Error('group_send_reference_missing_from_store');
+    CRM.saveNow(true); // Strict synchronous disk write before replying to the caller.
+  } catch {
+    // External send may have happened. No 5xx/no automatic retry on lost persistence.
+    return { ok: false, messageId: id, resolved: targetJid !== value,
+      outcome: 'UNKNOWN', retry: false, error: 'group_send_receipt_not_persisted' };
+  }
+  return { ok: true, messageId: id, resolved: targetJid !== value,
+    receiptPersisted: true };
 }
 
 const AI = createAiEngine({
@@ -455,7 +486,9 @@ app.post('/crm/send', secure, async (req, res) => {
   if (!jid || !text) return res.status(400).json({ error: 'jid_and_text_required' });
 
   try {
-    res.json(await sendCrmText(jid, text));
+    const receipt = await sendCrmText(jid, text);
+    // 202 UNKNOWN explicitly blocks a retry; it is NOT a delivery receipt.
+    res.status(receipt.ok === false && receipt.outcome === 'UNKNOWN' ? 202 : 200).json(receipt);
   } catch (error) {
     const code = error?.message === 'whatsapp_not_connected' || error?.message === 'contact_number_still_syncing'
       ? 409

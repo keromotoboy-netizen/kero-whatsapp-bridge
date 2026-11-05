@@ -16,13 +16,13 @@
 
 As rotas usam o middleware existente `secure`, não interpretação de comandos de IA. Favoritar/excluir/status exigem JSON com `jid` (JID de grupo terminado em `@g.us`) e `id` (messageId **real** obtido após envio). A chave lógica é `(jid,id)`, e a mensagem precisa constar no histórico local como `fromMe === true`. Nunca reconstruir `id` a partir de hash. Não converter HTTP 200 em prova de entrega.
 
-## Envio já existente — não alterado
+## Envio: somente grupos alterados na branch candidata
 
 `POST /crm/send` com `{ "jid": "...", "text": "..." }`.
 
-Resposta de sucesso da rota atual: `{ "ok": true, "messageId": string|null, "resolved": boolean }`, HTTP 200. Isso comprova apenas retorno de `sock.sendMessage` pela biblioteca, **não** confirmação do servidor, entrega ou leitura. Falha de conexão retorna 409; outras falhas 502; corpo inválido 400. Se `messageId` vier nulo, tratar referência como não recuperável/UNKNOWN e **não** disparar novamente cegamente.
+Em grupos, após `sock.sendMessage`, a branch valida `sent.key.remoteJid === targetJid`, `fromMe===true`, `messageId` válido e a existência do registro no CRM. Só devolve HTTP 200 com `{ok:true,messageId,resolved,receiptPersisted:true}` **após `CRM.saveNow(true)` concluir**. Isso prova gravação síncrona local da referência, não ACK definitivo do servidor, entrega, leitura ou fsync contra perda de energia. Em timeout, referência inválida ou falha de gravação *depois do efeito externo possível*, devolve HTTP 202 com `{ok:false,outcome:"UNKNOWN",retry:false,messageId:string|null,error:"..."}`; nunca disparar novamente automaticamente. Regras de validação anteriores, incluindo HTTP 400 e 409, continuam. Mensagens privadas mantêm o comportamento anterior.
 
-**Integração Frente 3:** o runner candidato que procura `response.key.id` precisa adaptar-se ao `response.messageId` realmente emitido pelo Bridge. Não alterar o runner nesta frente.
+**Integração Frente 3:** o runner da Frente 3 no PR #10 já reconhece `response.messageId` do Bridge. Em HTTP 202/`ok:false`, deve marcar `UNKNOWN` e não executar retry. Não alterar o runner nesta frente.
 
 ## Favoritamento — 1 mensagem por chamada
 
@@ -96,7 +96,7 @@ Status análogo, mas com `operation:"delete"` e `deleted` em vez de `starred`:
 
 ## Testes e limites de homologação
 
-43 testes sintéticos locais passaram: 14 exclusão, 14 favoritamento, 3 CRM-store/recuperação, 8 testes pareados F4 em sombra e 4 testes de recibo de envio por grupo. Incluem chave errada, mensagem de terceiros, grupo errado, timeout, falha de disco, reinício, duplicação, exclusão local e recibo durável. Nenhum teste acessou a sessão real do WhatsApp.
+53 testes locais/sintéticos passaram: 14 exclusão, 14 favoritamento, 3 CRM-store/recuperação, 8 testes pareados F4 em sombra e 14 testes de envio por grupo. Incluem chave errada, mensagem de terceiros, grupo errado, timeout, falha de disco, reinício, duplicação, exclusão local e recibo durável. Nenhum teste acessou a sessão real do WhatsApp.
 
 **Pendente:** homologação de eventos reais Baileys e ACK individual em janela controlada; validação de recebimento dos eventos pelo Bridge em Railway; conciliação das frentes 1/3/4; deploy seguro só após resolver patch staged destrutivo, volume, backups, locks e autorizações. Sem operação real de WhatsApp sem autorização individual.
 
@@ -122,6 +122,13 @@ Código: `crm-group-star.mjs`, `crm-group-delete.mjs`, `test/crm-group-paired-sh
 
 **Entrada F3/F4 preservada:** `KERO-SG-EVENT-V1`; saída F3 `KERO-F3-SG-SHADOW-V1`; callback lógico `SG_SHADOW_OBSERVATION`. Os recibos F2 são evidência interna para adaptadores confiáveis do servidor, nunca permissões do Xiaomi. Em qualquer ação sombra: `effects:0`, `canExecute:false`, `retry:false`. Não criar outro canal de WhatsApp, fila, executor ou novo gateway. F4 pode ampliar testes sintéticos de leitura sem chamar rotas reais nem alterar `sg-robo.js`/`sg-jogar.js`.
 
-**Recibo individual de envio:** a função existente `sendCrmText` produz `{ok:true,messageId,resolved}`, e a associação a grupo ocorre na chave `sent.key.remoteJid` recebida da biblioteca. Foram testados pares por grupo, IDs iguais em grupos distintos, ID ausente e timeout, sem enviar mensagens reais. Porém o armazenamento inicial usa `CRM.upsertMessage` com gravação adiada em alguns caminhos: **não há comprovação de durabilidade pós-ACK para cada envio antes de reinício**. Não declarar recuperabilidade integral de O.S., não repetir envios incertos, não ativar exclusão real.
+**Recibo individual de envio:** a função existente `sendCrmText` produz `{ok:true,messageId,resolved}`, e a associação a grupo ocorre na chave `sent.key.remoteJid` recebida da biblioteca. Foram testados pares por grupo, IDs iguais em grupos distintos, ID ausente e timeout, sem enviar mensagens reais. Na branch candidata, o envio para grupos exige `CRM.saveNow(true)` concluído antes de retornar `ok:true`, e um teste de armazenamento real comprovou a recuperação após reinício simulado. **Não há garantia de recuperar ID se o processo morrer antes de receber o ACK ou se faltar fsync perante falha de energia.** Os demais caminhos privados permanecem inalterados. Não declarar recuperabilidade integral de O.S., não repetir envios incertos, não ativar exclusão real.
 
 **Escopo e evidências:** 43/43 testes sintéticos aprovados (0 falhas) no CINZA; HEAD desta etapa é o commit de correção posterior a `e41a9ca`. Repositório continua PR #30 draft. Nenhum merge/deploy; produção Railway ainda no commit `4ccfa3d4`; patch staged `0be4ae3c` continua destrutivo para `whatsapp-auth-storage`, jamais aceitar. Necessários para AVISO 2: confirmação real do fluxo WhatsApp e garantia de persistência imediata de recibo de envio, identidade atestada, autoridade da fila/política, licença explícita para alvos reais, backup e rollback.
+
+
+## Terceira rodada — persistência síncrona do recibo após ACK (05/11 UTC)
+
+Código `server.mjs`: gravação estrita com `CRM.saveNow(true)` apenas para `@g.us`, comparação do par `targetJid + sent.key.id` e `fromMe:true`, verificação local do registro antes da resposta. Em caso de retorno do socket sem ID válido, erro de rede, chave de grupo divergente ou falha pós-ACK de persistência: `HTTP 202`, `ok:false`, `outcome:"UNKNOWN"`, `retry:false`. Não confundir `receiptPersisted:true` com ACK do servidor, entrega ou revogação.
+
+Testes novos/atualizados em `test/crm-group-send-receipt-shadow.test.mjs` e `test/crm-group-send-durable-store.test.mjs`, incluindo disco real temporário, JSON recuperável após reinício, falha de gravação e compatibilidade de envio privado. Total da suíte específica: **53/53 aprovados, 0 falhas**, somente locais; nenhum WhatsApp real. Proteções F3/F4, `effects:0`, `canExecute:false` e `retry:false` preservadas. Produção bloqueada pelo staged-delete de volume Railway e ausência de E2E autorizado. Para rollback da terceira rodada, reverter somente o commit que introduz `saveNow(true)` no `server.mjs`, com backup no CINZA `server.mjs.backup-f2-postack-20261104`.
