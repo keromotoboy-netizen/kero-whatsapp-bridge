@@ -8,7 +8,7 @@
 
 - Repositório: `keromotoboy-netizen/kero-whatsapp-bridge`.
 - Base verificada: `2393105e6ecf23903e9186665f9e33d047e8bf70`.
-- Correção testada: `f634aed33500684c694b9ebe5fea0ad6205f3a56`.
+- Correção testada: `f634aed33500684c694b9ebe5fea0ad6205f3a56` (primeira rodada); segunda rodada: correção de UNKNOWN e bloqueio de star após delete.
 - Railway ativo na verificação: `d33a82f9-1aa5-45e5-87bb-b1403bf7b547`, commit `4ccfa3d4c7a43e326886e1617106d1c085e2ed1c`; a correção deste PR não está publicada.
 - **Nunca** aceitar o patch Railway staged `0be4ae3c-1c10-4c0d-9f2f-8ea1b8418a2a`: inclui `whatsapp-auth-storage` em `staged-delete`. Preservar `/data/auth`.
 
@@ -52,6 +52,8 @@ Formato do status, tanto na resposta da ação quanto na consulta:
 - HTTP 202 = pendente/desconhecido; não repetir a operação. HTTP 200 da ação somente quando há recibo confirmado; HTTP 200 da consulta **não** muda o `confirmed`.
 - HTTP 502 = resultado incerto, **sem retry automático**; 503 = falha na reserva persistente (ação não efetuada); 409 = offline/mensagem apagada; 400 = chave malformada; 404 = mensagem própria não localizada.
 - Repetição da mesma chave devolve `duplicateSuppressed:true` sem nova chamada externa.
+- Após `deleteRequestedAt`, novas solicitações `/crm/star` são bloqueadas com HTTP 409 e `noAction:true`.
+- Um favorito observado sem gravação durável é `UNKNOWN`, não `PENDING`.
 
 ## Exclusão para todos — 1 mensagem própria por chamada
 
@@ -80,6 +82,7 @@ Status análogo, mas com `operation:"delete"` e `deleted` em vez de `starred`:
 - `messages.delete` isoladamente indica remoção local; **não prova exclusão para todos**.
 - HTTP 202 = pendente/ambíguo e nenhuma nova exclusão automática; HTTP 200 da ação só com evidência durável; HTTP 502 = resultado incerto, não repetir; demais erros 400/404/409/503 conforme validação e disponibilidade.
 - Mesmo após restart ou timeout, as reservas existentes impedem uma segunda chamada para a mesma chave.
+- Revogação observada sem recibo durável é `UNKNOWN`, não `PENDING`.
 - Mensagens já excluídas localmente sem recibo de revogação retornam 409, sem efeito externo.
 
 ## Níveis de confirmação — não confundir
@@ -93,7 +96,7 @@ Status análogo, mas com `operation:"delete"` e `deleted` em vez de `starred`:
 
 ## Testes e limites de homologação
 
-25 testes sintéticos locais passaram: 12 exclusão, 10 favoritamento e 3 CRM-store/recuperação. Incluem chave errada, mensagem de terceiros, grupo errado, timeout, falha de disco, reinício, duplicação, exclusão local e recibo durável. Nenhum teste acessou a sessão real do WhatsApp.
+31 testes sintéticos locais passaram: 14 exclusão, 14 favoritamento e 3 CRM-store/recuperação. Incluem chave errada, mensagem de terceiros, grupo errado, timeout, falha de disco, reinício, duplicação, exclusão local e recibo durável. Nenhum teste acessou a sessão real do WhatsApp.
 
 **Pendente:** homologação de eventos reais Baileys e ACK individual em janela controlada; validação de recebimento dos eventos pelo Bridge em Railway; conciliação das frentes 1/3/4; deploy seguro só após resolver patch staged destrutivo, volume, backups, locks e autorizações. Sem operação real de WhatsApp sem autorização individual.
 

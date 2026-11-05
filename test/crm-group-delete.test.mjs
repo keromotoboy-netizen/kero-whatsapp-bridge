@@ -96,3 +96,24 @@ test('concurrent identical deletions dispatch only once',async()=>{
  assert.equal(f.calls.length,1);
  assert.equal([a.code,b.code].every(c=>c===202),true);
 });
+test('observed revoke without durable receipt is UNKNOWN not PENDING',async()=>{
+ const f=fixture();
+ await f.invoke('/crm/delete',{jid:jid1,id:id1});
+ f.messages[jid1][0].deletedForEveryone=true;
+ f.messages[jid1][0].deleteConfirmedAt=Date.now();
+ f.messages[jid1][0].deleteReceiptDurable=false;
+ const st=await f.invoke('/crm/delete-status',{jid:jid1,id:id1});
+ assert.equal(st.data.outcome,'UNKNOWN');assert.equal(st.data.confirmed,false);
+ const retry=await f.invoke('/crm/delete',{jid:jid1,id:id1});
+ assert.equal(retry.code,202);assert.equal(retry.data.outcome,'UNKNOWN');assert.equal(f.calls.length,1);
+});
+test('uncertain delete after socket timeout remains UNKNOWN across restart',async()=>{
+ const f=fixture({socketFails:true});
+ const first=await f.invoke('/crm/delete',{jid:jid1,id:id1});
+ assert.equal(first.code,502);assert.equal(first.data.outcome,'UNKNOWN');
+ const resumed=fixture({persistedMessages:f.messages});
+ const later=await resumed.invoke('/crm/delete-status',{jid:jid1,id:id1});
+ assert.equal(later.data.outcome,'UNKNOWN');
+ assert.equal((await resumed.invoke('/crm/delete',{jid:jid1,id:id1})).code,202);
+ assert.equal(resumed.calls.length,0);
+});

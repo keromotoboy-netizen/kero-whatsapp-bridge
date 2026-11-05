@@ -20,9 +20,11 @@ export function mountCrmGroupStar(app, secure, { getSocket, isConnected, crm }) 
     // Only an observed, durably saved WhatsApp state update proves a star.
     const confirmed = key.msg.starred === true && !!key.msg.starObservedAt && key.msg.starReceiptDurable === true;
     const requested = !!key.msg.starRequestedAt;
+    // An observed star that failed durable save is UNKNOWN, never ordinary PENDING.
+    const uncertain = !!key.msg.starOutcomeUnknownAt || (key.msg.starred === true && !confirmed);
     return { ok: true, operation: 'star', requested,
       accepted: !!key.msg.starCommandAckAt, starred: confirmed, confirmed,
-      outcome: confirmed ? 'CONFIRMED' : key.msg.starOutcomeUnknownAt || (key.msg.starred && !key.msg.starObservedAt) ? 'UNKNOWN' : requested ? 'PENDING' : 'NOT_REQUESTED',
+      outcome: confirmed ? 'CONFIRMED' : uncertain ? 'UNKNOWN' : requested ? 'PENDING' : 'NOT_REQUESTED',
       confirmationSource: confirmed ? 'messages.update:starred' : null };
   }
   app.post('/crm/star-status', secure, async (req, res) => {
@@ -32,7 +34,9 @@ export function mountCrmGroupStar(app, secure, { getSocket, isConnected, crm }) 
   app.post('/crm/star', secure, async (req, res) => {
     const key = inspect(req, res);
     if (!key) return;
-    if (key.msg.deleted) return res.status(409).json({ ok: false, error: 'message_already_deleted' });
+    // Never start a new star for an O.S. already being revoked or locally deleted.
+    if (key.msg.deleted || key.msg.deletedForEveryone === true) return res.status(409).json({ ok: false, error: 'message_already_deleted' });
+    if (key.msg.deleteRequestedAt) return res.status(409).json({ ok: false, error: 'message_delete_already_requested', noAction: true });
     if (status(key).confirmed) return res.json({ ...status(key), duplicateSuppressed: true });
     if (key.msg.starred === true && !key.msg.starObservedAt) return res.status(202).json({ ...status(key), duplicateSuppressed: true });
     if (key.msg.starRequestedAt) return res.status(202).json({ ...status(key), duplicateSuppressed: true });

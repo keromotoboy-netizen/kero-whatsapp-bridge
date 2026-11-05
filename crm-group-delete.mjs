@@ -21,11 +21,15 @@ export function mountCrmGroupDelete(app, secure, { getSocket, isConnected, crm }
     const confirmed = key.msg.deletedForEveryone === true &&
       !!key.msg.deleteConfirmedAt && key.msg.deleteReceiptDurable === true;
     const requested = !!key.msg.deleteRequestedAt;
+    // Locally observed but not durably recorded revocation is an UNKNOWN state.
+    const uncertain = !!key.msg.deleteOutcomeUnknownAt ||
+      (key.msg.deletedForEveryone === true && !confirmed) ||
+      (requested && key.msg.deleted === true && !confirmed);
     return {
       ok: true, operation: 'delete', requested,
       accepted: !!key.msg.deleteCommandAckAt,
       confirmed, deleted: confirmed,
-      outcome: confirmed ? 'CONFIRMED' : key.msg.deleteOutcomeUnknownAt ? 'UNKNOWN' : requested ? 'PENDING' : 'NOT_REQUESTED',
+      outcome: confirmed ? 'CONFIRMED' : uncertain ? 'UNKNOWN' : requested ? 'PENDING' : 'NOT_REQUESTED',
       confirmationSource: confirmed ? 'messages.update:REVOKE' : null
     };
   }

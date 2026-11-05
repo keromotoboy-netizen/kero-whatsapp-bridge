@@ -71,3 +71,29 @@ test('deleted own group message cannot be starred',async()=>{
  const r=await t.req('/crm/star',{jid:a,id:idA});
  assert.equal(r.code,409);assert.equal(t.calls.length,0);
 });
+test('star observed but receipt not persisted is UNKNOWN and never re-executed', async()=> {
+ const t=setup();
+ await t.req('/crm/star',{jid:a,id:idA});
+ t.mA.starred=true; t.mA.starObservedAt=Date.now(); t.mA.starReceiptDurable=false;
+ const st=await t.req('/crm/star-status',{jid:a,id:idA});
+ assert.equal(st.data.confirmed,false);assert.equal(st.data.outcome,'UNKNOWN');
+ const retry=await t.req('/crm/star',{jid:a,id:idA});
+ assert.equal(retry.code,202);assert.equal(t.calls.length,1);
+});
+test('do not favorite a message once delete-for-everyone has been requested', async()=>{
+ const t=setup();t.mA.deleteRequestedAt=Date.now();
+ const r=await t.req('/crm/star',{jid:a,id:idA});
+ assert.equal(r.code,409);assert.equal(r.data.noAction,true);assert.equal(t.calls.length,0);
+});
+test('concurrent star requests for the same key have only one external effect', async()=>{
+ const t=setup();
+ const [x,y]=await Promise.all([t.req('/crm/star',{jid:a,id:idA}),t.req('/crm/star',{jid:a,id:idA})]);
+ assert.equal(x.code,202);assert.equal(y.code,202);assert.equal(t.calls.length,1);
+});
+test('unknown star after socket timeout is explicit and never retried', async()=>{
+ const t=setup({fail:true});
+ const first=await t.req('/crm/star',{jid:a,id:idA});
+ assert.equal(first.code,502);assert.equal(first.data.outcome,'UNKNOWN');
+ const next=await t.req('/crm/star-status',{jid:a,id:idA});
+ assert.equal(next.data.outcome,'UNKNOWN');assert.equal(t.calls.length,1);
+});
