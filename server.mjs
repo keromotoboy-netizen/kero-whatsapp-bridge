@@ -9,7 +9,7 @@ import makeWASocket, {
 import QRCode from 'qrcode';
 import pino from 'pino';
 import fs from 'node:fs';
-import { createHmac } from 'node:crypto';
+import { createHmac, createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { createCrmStore } from './crm-store.mjs';
 import { createOutboxWorker, parseAllowedJids } from './outbox-worker.mjs';
@@ -172,7 +172,7 @@ async function resolveOutboundJid(jid) {
   return CRM.resolveSendJid(value);
 }
 
-async function sendCrmText(jid, text) {
+async function sendCrmText(jid, text, dispatchKey = null) {
   const value = String(jid || '');
   const message = String(text || '').trim();
   if (!value || !message) throw new Error('jid_and_text_required');
@@ -186,6 +186,42 @@ async function sendCrmText(jid, text) {
   // Group sends must not report a usable receipt until its exact group+id is on disk.
   // This is AFTER the external effect; any uncertainty must never trigger a blind resend.
   const group = targetJid.endsWith('@g.us');
+  // Optional F3 command identity; old callers remain unchanged until coordinated.
+  const hasDispatchKey = dispatchKey != null;
+  if (group && hasDispatchKey && (typeof dispatchKey !== 'string' ||
+      !/^[A-Za-z0-9_.:-]{8,128}$/.test(dispatchKey))) {
+    return { ok: false, messageId: null, resolved: targetJid !== value,
+      outcome: 'UNKNOWN', retry: false, error: 'invalid_group_dispatch_key' };
+  }
+  const receiptKey = group && hasDispatchKey
+    ? createHash('sha256').update(JSON.stringify([targetJid, dispatchKey])).digest('hex') : null;
+  const payloadDigest = receiptKey ? createHash('sha256').update(message).digest('hex') : null;
+  const reserved = receiptKey ? (CRM.state.groupSendReservations ||= {}) : null;
+  if (receiptKey) {
+    const existing = reserved[receiptKey];
+    if (existing) {
+      if (existing.payloadDigest !== payloadDigest) {
+        return { ok: false, messageId: null, resolved: targetJid !== value,
+          outcome: 'UNKNOWN', retry: false, error: 'group_dispatch_key_conflict' };
+      }
+      const previouslyRecorded = existing.phase === 'PERSISTED' &&
+        CRM.state?.messages?.[targetJid]?.some(m =>
+          m?.id === existing.messageId && m?.fromMe === true && m?.jid === targetJid);
+      if (previouslyRecorded) return { ok: true, messageId: existing.messageId,
+        resolved: targetJid !== value, receiptPersisted: true, duplicateSuppressed: true };
+      // Crash before ACK, ambiguous socket outcome, or missing local evidence.
+      return { ok: false, messageId: existing.messageId || null,
+        resolved: targetJid !== value, outcome: 'UNKNOWN', retry: false,
+        duplicateSuppressed: true, error: 'group_dispatch_already_reserved' };
+    }
+    reserved[receiptKey] = { phase: 'RESERVED', payloadDigest,
+      groupJid: targetJid, createdAt: Date.now() };
+    try { CRM.saveNow(true); } catch {
+      delete reserved[receiptKey]; // An uncertain file write never authorizes a send.
+      return { ok: false, messageId: null, resolved: targetJid !== value,
+        outcome: 'UNKNOWN', retry: false, error: 'group_dispatch_reservation_not_durable' };
+    }
+  }
   let sent;
   try {
     sent = await sock.sendMessage(targetJid, { text: message });
@@ -209,8 +245,16 @@ async function sendCrmText(jid, text) {
     const recorded = CRM.state?.messages?.[targetJid]?.some(
       m => m?.id === id && m?.fromMe === true && m?.jid === targetJid);
     if (!recorded) throw new Error('group_send_reference_missing_from_store');
+    if (receiptKey) reserved[receiptKey] = {
+      ...reserved[receiptKey], phase: 'PERSISTED', messageId: id, persistedAt: Date.now()
+    };
     CRM.saveNow(true); // Strict synchronous disk write before replying to the caller.
   } catch {
+    // Failed writes invalidate even an in-memory success; never report a phantom receipt.
+    if (receiptKey) {
+      reserved[receiptKey] = { ...reserved[receiptKey], phase: 'UNKNOWN', messageId: id };
+      try { CRM.saveNow(true); } catch {}
+    }
     // External send may have happened. No 5xx/no automatic retry on lost persistence.
     return { ok: false, messageId: id, resolved: targetJid !== value,
       outcome: 'UNKNOWN', retry: false, error: 'group_send_receipt_not_persisted' };
@@ -486,7 +530,7 @@ app.post('/crm/send', secure, async (req, res) => {
   if (!jid || !text) return res.status(400).json({ error: 'jid_and_text_required' });
 
   try {
-    const receipt = await sendCrmText(jid, text);
+    const receipt = await sendCrmText(jid, text, req.body?.dispatchKey);
     // 202 UNKNOWN explicitly blocks a retry; it is NOT a delivery receipt.
     res.status(receipt.ok === false && receipt.outcome === 'UNKNOWN' ? 202 : 200).json(receipt);
   } catch (error) {
