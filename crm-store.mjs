@@ -172,13 +172,14 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
     if (trimmed) console.log('[crm] enxuto: mensagens antigas so no D1 =' + trimmed);
   }
 
-  const saveNow = () => {
+  const saveNow = (strict = false) => {
     try {
       state.updatedAt = Date.now();
       fs.writeFileSync(file + '.tmp', JSON.stringify(state));
       fs.renameSync(file + '.tmp', file);
     } catch (error) {
       console.error('[crm] failed to save state', error?.message || error);
+      if (strict) throw error;
     }
   };
 
@@ -335,7 +336,7 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
     if (!chat.archived) {
       const arr = state.messages[jid] ||= [];
       idx = arr.findIndex(x => x.id === id);
-      if (idx >= 0) arr[idx] = { ...arr[idx], ...item };
+      if (idx >= 0) arr[idx] = { ...arr[idx], ...item, deleted: arr[idx].deleted === true || item.deleted === true };
       else arr.push(item);
       arr.sort((a,b) => a.timestamp - b.timestamp);
       if (MAX_MESSAGES_PER_CHAT > 0 && arr.length > MAX_MESSAGES_PER_CHAT) {
@@ -390,6 +391,7 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
 
   const handleMessageUpdates = updates => {
     let changed = false;
+    const actionReceipts = new Set();
     for (const entry of updates || []) {
       const key = entry?.key;
       const update = entry?.update || {};
@@ -401,6 +403,16 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
 
       // WhatsApp can report SERVER_ACK(1), DELIVERY_ACK(2), READ(3), PLAYED(4)
       // asynchronously. Only store monotonic numeric status; never log message data.
+      // Baileys app-state sync for a star/unstar action on one message.
+      if (item && typeof update.starred === 'boolean' &&
+          (item.starred !== update.starred || (update.starred && !item.starObservedAt))) {
+        item.starred = update.starred;
+        item.starObservedAt = update.starred ? Date.now() : null;
+        item.starReceiptDurable = false;
+        item.starUpdatedAt = Date.now();
+        actionReceipts.add(item);
+        changed = true;
+      }
       if (item && Number.isInteger(update.status) && update.status >= 0 && update.status <= 4) {
         const previous = Number.isInteger(item.deliveryStatus) ? item.deliveryStatus : -1;
         if (update.status > previous) {
@@ -414,6 +426,9 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
           item.deleted = true;
           item.deletedAt = Date.now();
           item.deletedForEveryone = true;
+          item.deleteConfirmedAt = Date.now();
+          item.deleteReceiptDurable = false;
+          actionReceipts.add(item);
           changed = true;
         }
         continue;
@@ -450,7 +465,24 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
         }
       }
     }
-    if (changed) touch();
+    if (changed) {
+      touch();
+      if (actionReceipts.size) {
+        // Confirmation is only exposed after the observed event is durably stored.
+        for (const msg of actionReceipts) {
+          if (msg.starObservedAt) msg.starReceiptDurable = true;
+          if (msg.deleteConfirmedAt) msg.deleteReceiptDurable = true;
+        }
+        try { saveNow(true); }
+        catch {
+          // Keep the request reserved; a failed disk write must not confirm it.
+          for (const msg of actionReceipts) {
+            msg.starReceiptDurable = false;
+            msg.deleteReceiptDurable = false;
+          }
+        }
+      }
+    }
   };
 
   const upsertPresence = payload => {

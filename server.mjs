@@ -9,7 +9,7 @@ import makeWASocket, {
 import QRCode from 'qrcode';
 import pino from 'pino';
 import fs from 'node:fs';
-import { createHmac } from 'node:crypto';
+import { createHmac, createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { createCrmStore } from './crm-store.mjs';
 import { createOutboxWorker, parseAllowedJids } from './outbox-worker.mjs';
@@ -20,6 +20,8 @@ import { selectAuthDirectory } from './auth-directory.mjs';
 import { maintenanceMutationAllowed, scheduledMaintenanceAllowed } from './maintenance-permissions.mjs';
 import { mountArchivedGroupCleanup } from './archived-group-cleanup.mjs';
 import { createCrmArchivedCleanup } from './archived-cleanup-service.mjs';
+import { mountCrmGroupStar } from './crm-group-star.mjs';
+import { mountCrmGroupDelete } from './crm-group-delete.mjs';
 
 
 // KERO-CEO-PAUSE-UNTIL-ORDER-20261104-v1: no timer or automatic release.
@@ -186,7 +188,7 @@ async function resolveOutboundJid(jid) {
   return CRM.resolveSendJid(value);
 }
 
-async function sendCrmText(jid, text) {
+async function sendCrmText(jid, text, dispatchKey = null) {
   const value = String(jid || '');
   const message = String(text || '').trim();
   if (!value || !message) throw new Error('jid_and_text_required');
@@ -197,9 +199,84 @@ async function sendCrmText(jid, text) {
     throw new Error('contact_number_still_syncing');
   }
 
-  const sent = await sock.sendMessage(targetJid, { text: message });
-  if (sent) CRM.upsertMessage(sent);
-  return { ok: true, messageId: sent?.key?.id || null, resolved: targetJid !== value };
+  // Group sends must not report a usable receipt until its exact group+id is on disk.
+  // This is AFTER the external effect; any uncertainty must never trigger a blind resend.
+  const group = targetJid.endsWith('@g.us');
+  // Optional F3 command identity; old callers remain unchanged until coordinated.
+  const hasDispatchKey = dispatchKey != null;
+  if (group && hasDispatchKey && (typeof dispatchKey !== 'string' ||
+      !/^[A-Za-z0-9_.:-]{8,128}$/.test(dispatchKey))) {
+    return { ok: false, messageId: null, resolved: targetJid !== value,
+      outcome: 'UNKNOWN', retry: false, error: 'invalid_group_dispatch_key' };
+  }
+  const receiptKey = group && hasDispatchKey
+    ? createHash('sha256').update(JSON.stringify([targetJid, dispatchKey])).digest('hex') : null;
+  const payloadDigest = receiptKey ? createHash('sha256').update(message).digest('hex') : null;
+  const reserved = receiptKey ? (CRM.state.groupSendReservations ||= {}) : null;
+  if (receiptKey) {
+    const existing = reserved[receiptKey];
+    if (existing) {
+      if (existing.payloadDigest !== payloadDigest) {
+        return { ok: false, messageId: null, resolved: targetJid !== value,
+          outcome: 'UNKNOWN', retry: false, error: 'group_dispatch_key_conflict' };
+      }
+      const previouslyRecorded = existing.phase === 'PERSISTED' &&
+        CRM.state?.messages?.[targetJid]?.some(m =>
+          m?.id === existing.messageId && m?.fromMe === true && m?.jid === targetJid);
+      if (previouslyRecorded) return { ok: true, messageId: existing.messageId,
+        resolved: targetJid !== value, receiptPersisted: true, duplicateSuppressed: true };
+      // Crash before ACK, ambiguous socket outcome, or missing local evidence.
+      return { ok: false, messageId: existing.messageId || null,
+        resolved: targetJid !== value, outcome: 'UNKNOWN', retry: false,
+        duplicateSuppressed: true, error: 'group_dispatch_already_reserved' };
+    }
+    reserved[receiptKey] = { phase: 'RESERVED', payloadDigest,
+      groupJid: targetJid, createdAt: Date.now() };
+    try { CRM.saveNow(true); } catch {
+      delete reserved[receiptKey]; // An uncertain file write never authorizes a send.
+      return { ok: false, messageId: null, resolved: targetJid !== value,
+        outcome: 'UNKNOWN', retry: false, error: 'group_dispatch_reservation_not_durable' };
+    }
+  }
+  let sent;
+  try {
+    sent = await sock.sendMessage(targetJid, { text: message });
+  } catch (error) {
+    if (!group) throw error; // Preserve existing private/commercial send behavior.
+    return { ok: false, messageId: null, resolved: targetJid !== value,
+      outcome: 'UNKNOWN', retry: false, error: 'group_send_ack_unknown' };
+  }
+  if (!group) {
+    if (sent) CRM.upsertMessage(sent);
+    return { ok: true, messageId: sent?.key?.id || null, resolved: targetJid !== value };
+  }
+  const id = typeof sent?.key?.id === 'string' && sent.key.id.length >= 8 ? sent.key.id : null;
+  // Never associate a receipt with the wrong group or an incoming/non-owned message.
+  if (!id || sent?.key?.remoteJid !== targetJid || sent?.key?.fromMe !== true) {
+    return { ok: false, messageId: id, resolved: targetJid !== value,
+      outcome: 'UNKNOWN', retry: false, error: 'group_send_reference_unknown' };
+  }
+  try {
+    CRM.upsertMessage(sent);
+    const recorded = CRM.state?.messages?.[targetJid]?.some(
+      m => m?.id === id && m?.fromMe === true && m?.jid === targetJid);
+    if (!recorded) throw new Error('group_send_reference_missing_from_store');
+    if (receiptKey) reserved[receiptKey] = {
+      ...reserved[receiptKey], phase: 'PERSISTED', messageId: id, persistedAt: Date.now()
+    };
+    CRM.saveNow(true); // Strict synchronous disk write before replying to the caller.
+  } catch {
+    // Failed writes invalidate even an in-memory success; never report a phantom receipt.
+    if (receiptKey) {
+      reserved[receiptKey] = { ...reserved[receiptKey], phase: 'UNKNOWN', messageId: id };
+      try { CRM.saveNow(true); } catch {}
+    }
+    // External send may have happened. No 5xx/no automatic retry on lost persistence.
+    return { ok: false, messageId: id, resolved: targetJid !== value,
+      outcome: 'UNKNOWN', retry: false, error: 'group_send_receipt_not_persisted' };
+  }
+  return { ok: true, messageId: id, resolved: targetJid !== value,
+    receiptPersisted: true };
 }
 
 // KERO-PONTE-PARIDADE-31-10-20261105-v1: cartao Pix (da ponte de 31/10)
@@ -507,7 +584,9 @@ app.post('/crm/send', secure, async (req, res) => {
   if (!jid || !text) return res.status(400).json({ error: 'jid_and_text_required' });
 
   try {
-    res.json(await sendCrmText(jid, text));
+    const receipt = await sendCrmText(jid, text, req.body?.dispatchKey);
+    // 202 UNKNOWN explicitly blocks a retry; it is NOT a delivery receipt.
+    res.status(receipt.ok === false && receipt.outcome === 'UNKNOWN' ? 202 : 200).json(receipt);
   } catch (error) {
     const code = error?.message === 'whatsapp_not_connected' || error?.message === 'contact_number_still_syncing'
       ? 409
@@ -520,6 +599,22 @@ app.post('/crm/send', secure, async (req, res) => {
       error: error?.message || 'whatsapp_send_failed'
     });
   }
+});
+
+// Manual favorites: each sent group message is starred by its own messageId.
+// No publishing, deleting, reactions, photos or background scheduler here.
+mountCrmGroupStar(app, secure, {
+  getSocket: () => sock,
+  isConnected: () => status === 'open',
+  crm: CRM
+});
+
+// Manual delete-for-everyone, scoped to existing own group messages only.
+// Result is PENDING until a WhatsApp revoke event is observed; no retry.
+mountCrmGroupDelete(app, secure, {
+  getSocket: () => sock,
+  isConnected: () => status === 'open',
+  crm: CRM
 });
 
 app.post('/crm/send-media', secure, async (req, res) => {
