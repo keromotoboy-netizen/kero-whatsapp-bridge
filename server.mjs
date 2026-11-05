@@ -4,7 +4,7 @@ import makeWASocket, {
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   DisconnectReason,
-  extractSyncdPatches, decodeSyncdSnapshot, decodePatches, decodeSyncdMutations, proto
+  extractSyncdPatches, decodeSyncdSnapshot, decodePatches, decodeSyncdMutations, proto, BufferJSON, generateWAMessageFromContent
 } from 'baileys';
 import QRCode from 'qrcode';
 import pino from 'pino';
@@ -51,7 +51,23 @@ const mediaR2 = process.env.CRM_MEDIA_R2 === '1' && process.env.KERO_QUEUE_URL &
       dailyCap: Number(process.env.CRM_MEDIA_DAILY_CAP || 1500),
       download: raw => downloadMediaMessage(raw, 'buffer', {}, { reuploadRequest: sock?.updateMediaMessage, logger: pino({ level: 'silent' }) }) })
   : null;
-const CRM = createCrmStore(DATA_DIR, { mirror: d1Mirror, onMedia: mediaR2 ? mediaR2.enqueue : null });
+// KERO-PONTE-PARIDADE-31-10-20261105-v1: midia (da ponte de 31/10)
+// KERO 23/10/2026: guarda na memoria as ultimas midias recebidas (so a mensagem, sem o arquivo) para o atendente
+// baixar direto do WhatsApp por GET /crm/media/raw, mesmo com o envio ao R2 desligado. Nada vai para o disco.
+const mediaRaw = new Map();
+// KERO 27/10/2026: a ponte reiniciava e as fotos dos motoboys sumiam (501 falhas "404" num dia). Agora a MENSAGEM da midia
+// (so as chaves para baixar do WhatsApp, nunca o arquivo) tambem vai para o disco, por 3 dias.
+const MIDIA_DIR = DATA_DIR.replace(/[\/]+$/, '') + '-midia';
+try { fs.mkdirSync(MIDIA_DIR, { recursive: true }); } catch {}
+const guardarMidiaDisco = (id, raw) => { try { fs.writeFileSync(MIDIA_DIR + '/' + String(id).replace(/[^A-Za-z0-9_-]/g, '') + '.json', JSON.stringify(raw, BufferJSON.replacer)); } catch {} };
+const lerMidiaDisco = id => { try { return JSON.parse(fs.readFileSync(MIDIA_DIR + '/' + String(id).replace(/[^A-Za-z0-9_-]/g, '') + '.json', 'utf8'), BufferJSON.reviver); } catch { return null; } };
+setInterval(() => { try { for (const f of fs.readdirSync(MIDIA_DIR)) { const p = MIDIA_DIR + '/' + f; if (Date.now() - fs.statSync(p).mtimeMs > 3 * 86400e3) fs.unlinkSync(p); } } catch {} }, 3600e3).unref?.();
+const MEDIA_RAW_MAX = Number(process.env.CRM_MEDIA_RAW_MAX || 400);
+const lembrarMidia = (raw, jid, media) => {
+  const id = raw?.key?.id; if (id) { mediaRaw.delete(id); mediaRaw.set(id, raw); if (mediaRaw.size > MEDIA_RAW_MAX) mediaRaw.delete(mediaRaw.keys().next().value); guardarMidiaDisco(id, raw); }
+  return mediaR2 ? mediaR2.enqueue(raw, jid, media) : null;
+};
+const CRM = createCrmStore(DATA_DIR, { mirror: d1Mirror, onMedia: lembrarMidia });
 if (mediaR2) console.log('[media-r2] ligado');
 if (d1Mirror) {
   setInterval(() => { d1Mirror.flush().catch(() => null); }, Number(process.env.CRM_D1_INTERVAL_MS || 5000));
@@ -185,6 +201,44 @@ async function sendCrmText(jid, text) {
   if (sent) CRM.upsertMessage(sent);
   return { ok: true, messageId: sent?.key?.id || null, resolved: targetJid !== value };
 }
+
+// KERO-PONTE-PARIDADE-31-10-20261105-v1: cartao Pix (da ponte de 31/10)
+async function sendCrmPix(jid, { chave, tipo = 'CNPJ', nome, valor, referencia, formato = 'biz' } = {}) {
+  if (!sock || status !== 'open') throw new Error('whatsapp_not_connected');
+  if (!jid || !chave || !nome) throw new Error('jid_chave_nome_required');
+  const targetJid = await resolveOutboundJid(String(jid));
+  const centavos = Math.round(Number(valor || 0) * 100);
+  // 26/10: copia EXATA do cartao que o celular manda pela resposta rapida "/Pix" (capturado em cartoes-pix.jsonl):
+  // um item vazio, flow_type APPSWITCH e referral quick_reply. Sem isso o WhatsApp descartava o cartao.
+  const zero = { value: centavos, offset: 100 };
+  const params = {
+    currency: 'BRL',
+    total_amount: zero,
+    reference_id: String(referencia || Math.random().toString(36).slice(2, 13)).toUpperCase().slice(0, 11),
+    type: 'physical-goods',
+    order: { status: 'pending', subtotal: zero, order_type: 'ORDER', items: [{ name: '', amount: zero, quantity: 0, sale_amount: zero }] },
+    payment_settings: [{ type: 'pix_static_code', pix_static_code: { merchant_name: String(nome), key: String(chave), key_type: String(tipo).toUpperCase(), flow_type: 'APPSWITCH' } }],
+    share_payment_status: false,
+    is_soft_deleted: false,
+    referral: 'quick_reply'
+  };
+  const content = { interactiveMessage: { nativeFlowMessage: { buttons: [{ name: 'payment_info', buttonParamsJson: JSON.stringify(params) }] } } };
+  // formato 'exato' = reenvia o ultimo cartao capturado do celular (cartoes-pix.jsonl) sem mudar nada, so com id novo
+  if (formato === 'exato') {
+    const linhas = fs.readFileSync(DATA_DIR + '/cartoes-pix.jsonl', 'utf8').trim().split('\n');
+    const cap = JSON.parse(linhas.at(-1)).message;
+    const m2 = generateWAMessageFromContent(targetJid, proto.Message.fromObject(cap), { userJid: sock.user?.id });
+    await sock.relayMessage(targetJid, m2.message, { messageId: m2.key.id });
+    return { ok: true, messageId: m2.key.id, formato };
+  }
+  const msg = generateWAMessageFromContent(targetJid, content, { userJid: sock.user?.id });
+  // formato 'biz' (padrao) = com a marcacao de mensagem interativa do Business; 'cru' = sem ela
+  const extra = formato === 'cru' ? {} : { additionalNodes: [{ tag: 'biz', attrs: {}, content: [{ tag: 'interactive', attrs: { type: 'native_flow', v: '1' }, content: [{ tag: 'native_flow', attrs: { v: '9', name: 'payment_info' } }] }] }] };
+  await sock.relayMessage(targetJid, msg.message, { messageId: msg.key.id, ...extra });
+  CRM.upsertMessage({ key: msg.key, message: { conversation: `[Chave Pix] ${nome} ${tipo}: ${chave}` }, messageTimestamp: Math.floor(Date.now() / 1000) });
+  return { ok: true, messageId: msg.key.id };
+}
+
 
 const AI = createAiEngine({
   dataDir: DATA_DIR,
@@ -625,6 +679,81 @@ app.post('/crm/star', secure, async (req, res) => {
     res.json({ ok: true, starred: star, id });
   } catch (error) {
     res.status(502).json({ error: 'star_failed', message: error?.message || String(error) });
+  }
+});
+
+// ===== KERO-PONTE-PARIDADE-31-10-20261105-v1: rotas restauradas da ponte de 31/10 =====
+app.get('/crm/media/raw', secure, async (req, res) => {
+  const raw = mediaRaw.get(String(req.query.id || '')) || lerMidiaDisco(String(req.query.id || ''));
+  if (!raw) return res.status(404).json({ ok: false, error: 'midia nao esta na memoria da ponte' });
+  try {
+    const m = raw.message || {};
+    const inner = m.ephemeralMessage?.message || m.viewOnceMessage?.message || m.viewOnceMessageV2?.message || m.documentWithCaptionMessage?.message || m;
+    const tipo = Object.keys(inner).find(k => /(image|video|audio|document|sticker)Message$/.test(k));
+    const buf = await downloadMediaMessage(raw, 'buffer', {}, { reuploadRequest: sock?.updateMediaMessage, logger: pino({ level: 'silent' }) });
+    res.set('Content-Type', inner[tipo]?.mimetype || 'application/octet-stream');
+    res.send(buf);
+  } catch (e) { res.status(502).json({ ok: false, error: String(e?.message || e).slice(0, 160) }); }
+});
+
+app.post('/crm/send-pix', secure, async (req, res) => {
+  if (process.env.KERO_PIX_LIBERADO !== '1') return res.status(423).json({ ok: false, error: 'ceo_pause_until_further_order', pulado: 'ceo-pause-pix', resume_requires: 'explicit_ceo_order' });
+  try {
+    res.json(await sendCrmPix(String(req.body?.jid || ''), req.body || {}));
+  } catch (error) {
+    console.error('[crm] send-pix failed', { message: error?.message || String(error) });
+    res.status(error?.message === 'whatsapp_not_connected' ? 409 : 502).json({ error: error?.message || 'whatsapp_send_failed' });
+  }
+});
+
+// CEO 26/10/2026: salvar contato na agenda do numero da Kero ("Motoboy Fabricio", "Cliente Joao - Empresa").
+// GET devolve o nome salvo (name) e o do perfil (notify); POST salva/edita (sincroniza com o celular principal).
+function contatoDe(jid) {
+  const v = String(jid || '').replace(/:\d+@/, '@');
+  const pn = v.endsWith('@lid') ? CRM.state.lidMap?.[v] : v;
+  const lid = v.endsWith('@lid') ? v : Object.entries(CRM.state.lidMap || {}).find(([, p]) => p === v)?.[0];
+  const c = { ...(lid ? CRM.state.contacts?.[lid] : {}), ...(pn ? CRM.state.contacts?.[pn] : {}) };
+  return { pn: pn && pn.endsWith('@s.whatsapp.net') ? pn : null, lid: lid || null, name: c.name || null, notify: c.notify || c.verifiedName || null };
+}
+app.get('/crm/contact', secure, (req, res) => res.json(contatoDe(req.query.jid)));
+app.post('/crm/save-contact', secure, async (req, res) => {
+  const nome = String(req.body?.nome || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+  if (!req.body?.jid || !nome) return res.status(400).json({ error: 'jid_and_nome_required' });
+  if (!sock || status !== 'open') return res.status(409).json({ error: 'whatsapp_not_connected' });
+  try {
+    let { pn, lid } = contatoDe(req.body.jid);
+    if (!pn) { const r = await resolveOutboundJid(String(req.body.jid)); if (String(r).endsWith('@s.whatsapp.net')) pn = r; }
+    if (!pn) return res.status(422).json({ error: 'sem_numero', message: 'nao achei o numero desse contato (so LID)' });
+    if (typeof sock.addOrEditContact !== 'function') return res.status(501).json({ error: 'sem_suporte' });
+    await sock.addOrEditContact(pn, { fullName: nome, firstName: nome.split(' ')[0], saveOnPrimaryAddressbook: true, ...(lid ? { lidJid: lid } : {}) });
+    CRM.upsertContact({ id: pn, name: nome });
+    if (lid) CRM.upsertContact({ id: lid, name: nome });
+    res.json({ ok: true, pn, nome });
+  } catch (error) {
+    res.status(502).json({ error: 'save_contact_failed', message: error?.message || String(error) });
+  }
+});
+
+// CEO 23/10/2026: a IA poe/tira uma conversa de uma etiqueta so quando a equipe manda (Agendado, Devedores sanados).
+// Faturados, Grupos com clientes e etiquetas dos grupos de motoboy nunca sao tocadas por aqui.
+const LABEL_PROTEGIDA = /faturad|grupos? com clientes?|grupos? 1[,.]50|grupos? 2[,.]00|encaixes? acima|carros? ?& ?utilit|min\.? ?20/i;
+app.post('/crm/labels/chat', secure, async (req, res) => {
+  const jid = String(req.body?.jid || '');
+  const labelId = String(req.body?.labelId || '');
+  const acao = req.body?.acao === 'remove' ? 'remove' : req.body?.acao === 'add' ? 'add' : '';
+  if (!jid || !labelId || !acao) return res.status(400).json({ error: 'jid_labelId_acao_required' });
+  if (!sock || status !== 'open') return res.status(409).json({ error: 'whatsapp_not_connected' });
+  const nome = (CRM.snapshot({ limit: 0, includeMeta: true }).labels || []).find(l => String(l.id) === labelId)?.name || '';
+  if (!nome) return res.status(404).json({ error: 'label_not_found' });
+  // CEO 25/10/2026: a IA pode trocar as Listas de GRUPOS de motoboy (1,50 / 2,00 / Min 20$ / Encaixe / Carros) quando a regra
+  // do grupo mudou (regraGrupo:true). Faturados e Grupos com clientes continuam protegidas sempre.
+  const listaDeMotoboy = /grupos? 1[,.]50|grupos? 2[,.]00|encaixes? acima|carros? ?& ?utilit|min\.? ?20/i.test(nome);
+  if (LABEL_PROTEGIDA.test(nome) && !(listaDeMotoboy && req.body?.regraGrupo === true && /@g\.us$/.test(jid))) return res.status(403).json({ error: 'label_protegida', name: nome });
+  try {
+    await sock.chatModify(acao === 'add' ? { addChatLabel: { labelId } } : { removeChatLabel: { labelId } }, jid);
+    res.json({ ok: true, acao, label: nome });
+  } catch (error) {
+    res.status(502).json({ error: 'label_failed', message: error?.message || String(error) });
   }
 });
 
