@@ -597,6 +597,37 @@ app.post('/crm/react', secure, async (req, res) => {
   }
 });
 
+// KERO-PONTE-APAGAR-FAVORITAR-20261105-v1: CEO 05/11/2026 "nao dispare nunca nenhum sem favoritar". Rotas da ponte de 31/10, sem mudanca de comportamento.
+// Apagar PARA TODOS uma mensagem enviada pela Kero. Resposta 200 = o WhatsApp aceitou o pedido de apagar.
+app.post('/crm/delete', secure, async (req, res) => {
+  const jid = String(req.body?.jid || '');
+  const id = String(req.body?.id || '');
+  if (!jid || !id) return res.status(400).json({ error: 'jid_and_id_required' });
+  if (!sock || status !== 'open') return res.status(409).json({ error: 'whatsapp_not_connected' });
+  try {
+    const targetJid = await resolveOutboundJid(jid);
+    const sent = await sock.sendMessage(targetJid, { delete: { remoteJid: targetJid, id, fromMe: true } });
+    res.json({ ok: true, deleted: id, revokeId: sent?.key?.id || null });
+  } catch (error) {
+    res.status(502).json({ error: 'delete_failed', message: error?.message || String(error) });
+  }
+});
+// Favoritar (estrela) uma mensagem: dupla seguranca para a equipe achar e apagar pelos Favoritos.
+app.post('/crm/star', secure, async (req, res) => {
+  const jid = String(req.body?.jid || '');
+  const id = String(req.body?.id || '');
+  if (!jid || !id) return res.status(400).json({ error: 'jid_and_id_required' });
+  if (!sock || status !== 'open') return res.status(409).json({ error: 'whatsapp_not_connected' });
+  try {
+    const targetJid = await resolveOutboundJid(jid);
+    const star = req.body?.star !== false;
+    await sock.chatModify({ star: { messages: [{ id, fromMe: req.body?.fromMe !== false }], star } }, targetJid);
+    res.json({ ok: true, starred: star, id });
+  } catch (error) {
+    res.status(502).json({ error: 'star_failed', message: error?.message || String(error) });
+  }
+});
+
 app.post('/crm/resync', secure, async (_req, res) => {
   if (!sock || status !== 'open') return res.status(409).json({ error: 'whatsapp_not_connected' });
   const collections = ['critical_unblock_low','regular_high','regular_low','critical_block','regular'];
