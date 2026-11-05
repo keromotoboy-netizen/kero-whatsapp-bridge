@@ -1,6 +1,9 @@
 // KERO-SG-FAVORITOS-POR-MENSAGEM-20261104-v1
 // No send/delete; one star operation for each existing own group message.
 export function mountCrmGroupStar(app, secure, { getSocket, isConnected, crm }) {
+  // Volatile in-flight state: a reservation without ACK after restart is UNKNOWN.
+  const inFlight = new Set();
+  const ref = key => key.jid + '\u0000' + key.id;
   function inspect(req, res) {
     const jid = String(req.body?.jid || '');
     const id = String(req.body?.id || '');
@@ -22,9 +25,9 @@ export function mountCrmGroupStar(app, secure, { getSocket, isConnected, crm }) 
     const requested = !!key.msg.starRequestedAt;
     // An observed star that failed durable save is UNKNOWN, never ordinary PENDING.
     const uncertain = !!key.msg.starOutcomeUnknownAt || (key.msg.starred === true && !confirmed);
-    return { ok: true, operation: 'star', requested,
+    return { ok: true, operation: 'star', messageRef: { jid: key.jid, id: key.id }, requested,
       accepted: !!key.msg.starCommandAckAt, starred: confirmed, confirmed,
-      outcome: confirmed ? 'CONFIRMED' : uncertain ? 'UNKNOWN' : requested ? 'PENDING' : 'NOT_REQUESTED',
+      outcome: confirmed ? 'CONFIRMED' : uncertain ? 'UNKNOWN' : inFlight.has(ref(key)) ? 'IN_FLIGHT' : key.msg.starCommandAckAt ? 'PENDING' : requested ? 'UNKNOWN' : 'NOT_REQUESTED',
       confirmationSource: confirmed ? 'messages.update:starred' : null };
   }
   app.post('/crm/star-status', secure, async (req, res) => {
@@ -48,16 +51,21 @@ export function mountCrmGroupStar(app, secure, { getSocket, isConnected, crm }) 
       delete key.msg.starRequestedAt;
       return res.status(503).json({ ok: false, error: 'durable_reservation_failed' });
     }
+    inFlight.add(ref(key));
     try {
       await getSocket().chatModify({ star: { messages: [{ id: key.id, fromMe: true }], star: true } }, key.jid);
       key.msg.starCommandAckAt = Date.now();
       await crm.saveNow(true);
+      inFlight.delete(ref(key));
       const state = status(key);
       return res.status(state.confirmed ? 200 : 202).json({ ...state, confirmation: 'baileys_command_accepted_not_star_proof' });
     } catch {
       key.msg.starOutcomeUnknownAt = Date.now();
       try { await crm.saveNow(true); } catch {}
+      inFlight.delete(ref(key));
       return res.status(502).json({ ...status(key), ok: false, error: 'star_outcome_unconfirmed' });
+    } finally {
+      inFlight.delete(ref(key));
     }
   });
 }

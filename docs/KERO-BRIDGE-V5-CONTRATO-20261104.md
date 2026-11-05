@@ -96,10 +96,32 @@ Status análogo, mas com `operation:"delete"` e `deleted` em vez de `starred`:
 
 ## Testes e limites de homologação
 
-31 testes sintéticos locais passaram: 14 exclusão, 14 favoritamento e 3 CRM-store/recuperação. Incluem chave errada, mensagem de terceiros, grupo errado, timeout, falha de disco, reinício, duplicação, exclusão local e recibo durável. Nenhum teste acessou a sessão real do WhatsApp.
+43 testes sintéticos locais passaram: 14 exclusão, 14 favoritamento, 3 CRM-store/recuperação, 8 testes pareados F4 em sombra e 4 testes de recibo de envio por grupo. Incluem chave errada, mensagem de terceiros, grupo errado, timeout, falha de disco, reinício, duplicação, exclusão local e recibo durável. Nenhum teste acessou a sessão real do WhatsApp.
 
 **Pendente:** homologação de eventos reais Baileys e ACK individual em janela controlada; validação de recebimento dos eventos pelo Bridge em Railway; conciliação das frentes 1/3/4; deploy seguro só após resolver patch staged destrutivo, volume, backups, locks e autorizações. Sem operação real de WhatsApp sem autorização individual.
 
 ## Rollback
 
 Reverter somente o commit `f634aed33500684c694b9ebe5fea0ad6205f3a56` da branch candidata depois de confirmar HEAD e lock; base recuperável `2393105e6ecf23903e9186665f9e33d047e8bf70`. Backups locais no CINZA: `C:\Users\ailla\KeroAudits\bridge-group-actions-20261104\*.backup-frente2-20261104` e `test\*.backup-frente2-20261104`. Como **nenhum deploy foi executado**, não há rollback de produção nesta etapa.
+
+
+## Extensão para Frente 4 — sombra pareada (04/11/2026)
+
+**Aviso:** FRENTE 2 — BRIDGE V5 — RECIBOS E EXCLUSÃO PAREADA LIBERADOS PARA INTEGRAÇÃO EM SOMBRA. É somente liberação de testes sintéticos e adaptação de contratos, não liberação de execução no WhatsApp nem homologação produtiva.
+
+Código: `crm-group-star.mjs`, `crm-group-delete.mjs`, `test/crm-group-paired-shadow.test.mjs` e `test/crm-group-send-receipt-shadow.test.mjs`. Ambos endpoints de ação exigem o par literal `{jid,id}` de mensagem própria previamente conhecida. Respostas autenticadas retornam `messageRef:{jid,id}`, exclusivamente no canal privado de runtime; JID/messageId nunca entram em log, D1 compartilhado, handoff ou callback Xiaomi.
+
+**Máquina de estados exata:**
+- `NOT_REQUESTED`: nenhuma reserva existente.
+- `IN_FLIGHT`: reserva gravada e chamada Baileys atualmente em andamento neste processo. Nunca reexecute a chamada.
+- `PENDING`: retorno da biblioteca registrado duravelmente, sem evento conclusivo. `accepted:true` não prova entrega, estrela ou revogação.
+- `UNKNOWN`: timeout, resultado incerto, recibo não durável ou reserva após reinício sem ACK recuperável. Bloqueia nova tentativa automaticamente.
+- `CONFIRMED`: exclusivamente atualização individual de estrela `messages.update:starred` ou evento `messages.update:REVOKE` persistido no CRM para o mesmo `jid+id`.
+
+`/crm/star-status` e `/crm/delete-status` são consultas POST com auth, sem ações externas. HTTP 200 nessas consultas significa apenas resposta HTTP, **não** confirmação. O campo `outcome` e o par `messageRef` são obrigatórios na decisão de integração. HTTP 202 pode retornar `IN_FLIGHT`, `PENDING` ou `UNKNOWN` e sempre proíbe retry.
+
+**Entrada F3/F4 preservada:** `KERO-SG-EVENT-V1`; saída F3 `KERO-F3-SG-SHADOW-V1`; callback lógico `SG_SHADOW_OBSERVATION`. Os recibos F2 são evidência interna para adaptadores confiáveis do servidor, nunca permissões do Xiaomi. Em qualquer ação sombra: `effects:0`, `canExecute:false`, `retry:false`. Não criar outro canal de WhatsApp, fila, executor ou novo gateway. F4 pode ampliar testes sintéticos de leitura sem chamar rotas reais nem alterar `sg-robo.js`/`sg-jogar.js`.
+
+**Recibo individual de envio:** a função existente `sendCrmText` produz `{ok:true,messageId,resolved}`, e a associação a grupo ocorre na chave `sent.key.remoteJid` recebida da biblioteca. Foram testados pares por grupo, IDs iguais em grupos distintos, ID ausente e timeout, sem enviar mensagens reais. Porém o armazenamento inicial usa `CRM.upsertMessage` com gravação adiada em alguns caminhos: **não há comprovação de durabilidade pós-ACK para cada envio antes de reinício**. Não declarar recuperabilidade integral de O.S., não repetir envios incertos, não ativar exclusão real.
+
+**Escopo e evidências:** 43/43 testes sintéticos aprovados (0 falhas) no CINZA; HEAD desta etapa é o commit de correção posterior a `e41a9ca`. Repositório continua PR #30 draft. Nenhum merge/deploy; produção Railway ainda no commit `4ccfa3d4`; patch staged `0be4ae3c` continua destrutivo para `whatsapp-auth-storage`, jamais aceitar. Necessários para AVISO 2: confirmação real do fluxo WhatsApp e garantia de persistência imediata de recibo de envio, identidade atestada, autoridade da fila/política, licença explícita para alvos reais, backup e rollback.

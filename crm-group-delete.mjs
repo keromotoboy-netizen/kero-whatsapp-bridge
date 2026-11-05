@@ -2,6 +2,8 @@
 // Draft only: do not deploy before coordinating the attendant's deletion status contract.
 // The Bridge does not interpret LLM commands and never resends a deletion after uncertainty.
 export function mountCrmGroupDelete(app, secure, { getSocket, isConnected, crm }) {
+  const inFlight = new Set();
+  const ref = key => key.jid + '\u0000' + key.id;
   function inspect(req, res) {
     const jid = String(req.body?.jid || '');
     const id = String(req.body?.id || '');
@@ -26,10 +28,10 @@ export function mountCrmGroupDelete(app, secure, { getSocket, isConnected, crm }
       (key.msg.deletedForEveryone === true && !confirmed) ||
       (requested && key.msg.deleted === true && !confirmed);
     return {
-      ok: true, operation: 'delete', requested,
+      ok: true, operation: 'delete', messageRef: { jid: key.jid, id: key.id }, requested,
       accepted: !!key.msg.deleteCommandAckAt,
       confirmed, deleted: confirmed,
-      outcome: confirmed ? 'CONFIRMED' : uncertain ? 'UNKNOWN' : requested ? 'PENDING' : 'NOT_REQUESTED',
+      outcome: confirmed ? 'CONFIRMED' : uncertain ? 'UNKNOWN' : inFlight.has(ref(key)) ? 'IN_FLIGHT' : key.msg.deleteCommandAckAt ? 'PENDING' : requested ? 'UNKNOWN' : 'NOT_REQUESTED',
       confirmationSource: confirmed ? 'messages.update:REVOKE' : null
     };
   }
@@ -59,6 +61,7 @@ export function mountCrmGroupDelete(app, secure, { getSocket, isConnected, crm }
       delete key.msg.deleteRequestedAt;
       return res.status(503).json({ ok: false, error: 'durable_reservation_failed' });
     }
+    inFlight.add(ref(key));
     try {
       // Baileys official API: sendMessage(jid, {delete: original.key}).
       const originalKey = { remoteJid: key.jid, id: key.id, fromMe: true };
@@ -66,12 +69,16 @@ export function mountCrmGroupDelete(app, secure, { getSocket, isConnected, crm }
       await sock.sendMessage(key.jid, { delete: originalKey });
       key.msg.deleteCommandAckAt = Date.now();
       await crm.saveNow(true);
+      inFlight.delete(ref(key));
       const state = status(key);
       return res.status(state.confirmed ? 200 : 202).json(state);
     } catch {
       key.msg.deleteOutcomeUnknownAt = Date.now();
       try { await crm.saveNow(true); } catch {}
+      inFlight.delete(ref(key));
       return res.status(502).json({ ...status(key), ok: false, error: 'delete_outcome_unconfirmed' });
+    } finally {
+      inFlight.delete(ref(key));
     }
   });
 }
