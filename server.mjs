@@ -11,6 +11,7 @@ import pino from 'pino';
 import fs from 'node:fs';
 import { createHmac } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createCrmStore } from './crm-store.mjs';
 import { createOutboxWorker, parseAllowedJids } from './outbox-worker.mjs';
 import { createD1Mirror } from './d1-mirror.mjs';
@@ -31,6 +32,19 @@ export function ceoPauseDecision(action, body = {}) {
 
 const app = express();
 app.use(express.json({ limit: '24mb' }));
+// KERO-ORIGEM-20261108 (CEO 08/11, item 18): toda mensagem NOSSA ganha origem. 'ia' = atendente (cabecalho x-kero-origem: ia),
+// 'api' = qualquer outro cliente desta API (painel, scripts), 'humano' = digitada no aparelho (nao passou por aqui).
+// Nunca muda o que e enviado; so etiqueta. ORIGEM_ENVIO guarda id -> origem dos ultimos envios para o store consultar.
+const ORIGEM_REQ = new AsyncLocalStorage(), ORIGEM_ENVIO = new Map();
+app.use((req, res, next) => {
+  const bruto = String(req.get('x-kero-origem') || req.body?.origem || 'api').toLowerCase().replace(/[^a-z-]/g, '').slice(0, 20);
+  ORIGEM_REQ.run(bruto || 'api', next);
+});
+function marcarOrigem(sent) {
+  const id = sent?.key?.id; if (!id) return;
+  ORIGEM_ENVIO.set(String(id), ORIGEM_REQ.getStore() || 'api');
+  while (ORIGEM_ENVIO.size > 5000) ORIGEM_ENVIO.delete(ORIGEM_ENVIO.keys().next().value);
+}
 
 const PORT = Number(process.env.PORT || 3000);
 const API_SECRET = process.env.API_SECRET || '';
@@ -67,7 +81,7 @@ const lembrarMidia = (raw, jid, media) => {
   const id = raw?.key?.id; if (id) { mediaRaw.delete(id); mediaRaw.set(id, raw); if (mediaRaw.size > MEDIA_RAW_MAX) mediaRaw.delete(mediaRaw.keys().next().value); guardarMidiaDisco(id, raw); }
   return mediaR2 ? mediaR2.enqueue(raw, jid, media) : null;
 };
-const CRM = createCrmStore(DATA_DIR, { mirror: d1Mirror, onMedia: lembrarMidia });
+const CRM = createCrmStore(DATA_DIR, { mirror: d1Mirror, onMedia: lembrarMidia, origemDe: id => ORIGEM_ENVIO.get(String(id)) || null });
 if (mediaR2) console.log('[media-r2] ligado');
 if (d1Mirror) {
   setInterval(() => { d1Mirror.flush().catch(() => null); }, Number(process.env.CRM_D1_INTERVAL_MS || 5000));
@@ -198,7 +212,7 @@ async function sendCrmText(jid, text) {
   }
 
   const sent = await sock.sendMessage(targetJid, { text: message });
-  if (sent) CRM.upsertMessage(sent);
+  if (sent) { marcarOrigem(sent); CRM.upsertMessage(sent); }
   return { ok: true, messageId: sent?.key?.id || null, resolved: targetJid !== value };
 }
 
@@ -235,7 +249,7 @@ async function sendCrmPix(jid, { chave, tipo = 'CNPJ', nome, valor, referencia, 
   // formato 'biz' (padrao) = com a marcacao de mensagem interativa do Business; 'cru' = sem ela
   const extra = formato === 'cru' ? {} : { additionalNodes: [{ tag: 'biz', attrs: {}, content: [{ tag: 'interactive', attrs: { type: 'native_flow', v: '1' }, content: [{ tag: 'native_flow', attrs: { v: '9', name: 'payment_info' } }] }] }] };
   await sock.relayMessage(targetJid, msg.message, { messageId: msg.key.id, ...extra });
-  CRM.upsertMessage({ key: msg.key, message: { conversation: `[Chave Pix] ${nome} ${tipo}: ${chave}` }, messageTimestamp: Math.floor(Date.now() / 1000) });
+  marcarOrigem(msg); CRM.upsertMessage({ key: msg.key, message: { conversation: `[Chave Pix] ${nome} ${tipo}: ${chave}` }, messageTimestamp: Math.floor(Date.now() / 1000) });
   return { ok: true, messageId: msg.key.id };
 }
 
@@ -584,7 +598,7 @@ app.post('/crm/send-media', secure, async (req, res) => {
           error?.code || 'storage_error');
       }
     }
-    if (sent) CRM.upsertMessage(sent);
+    if (sent) { marcarOrigem(sent); CRM.upsertMessage(sent); }
     res.json({ ok: true, messageId: sent?.key?.id || null, resolved: targetJid !== jid });
   } catch (error) {
     console.error('[crm] media send failed', {
@@ -975,7 +989,7 @@ if (process.env.WA_OUTBOX_ENABLED === '1' && (outboxOnCloudflare || (process.env
         return { messageId: 'presence:composing' };
       }
       const sent = await sock.sendMessage(targetJid, { text });
-      if (sent) CRM.upsertMessage(sent);
+      if (sent) { marcarOrigem(sent); CRM.upsertMessage(sent); }
       await sock.sendPresenceUpdate('paused', targetJid).catch(() => null);
       return { messageId: sent?.key?.id || null };
     }

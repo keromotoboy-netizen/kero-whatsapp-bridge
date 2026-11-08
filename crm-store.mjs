@@ -137,7 +137,7 @@ const safeNameFromJid = jid => {
   return jid.split('@')[0]?.replace(/\D/g, '') || jid;
 };
 
-export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, onMedia = null,
+export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, onMedia = null, origemDe = null,
   keepMessagesPerChat = Math.max(0, Number(process.env.CRM_KEEP_MESSAGES_PER_CHAT || 0)) && Math.max(50, Number(process.env.CRM_KEEP_MESSAGES_PER_CHAT)) } = {}) {
   const file = path.join(path.dirname(dataDir), 'crm-state.json');
   let state = {
@@ -341,6 +341,7 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
       id,
       jid,
       fromMe: !!raw.key.fromMe,
+      origem: raw.key.fromMe ? (raw.origem || (typeof origemDe === 'function' && origemDe(id)) || 'humano') : null, // KERO-ORIGEM-20261108: ia | api | humano (so mensagem nossa)
       participant: raw.key.participant || null,
       pushName: raw.pushName || null,
       timestamp: ts,
