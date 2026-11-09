@@ -137,7 +137,7 @@ const safeNameFromJid = jid => {
   return jid.split('@')[0]?.replace(/\D/g, '') || jid;
 };
 
-export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, onMedia = null,
+export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, onMedia = null, origemDe = null,
   keepMessagesPerChat = Math.max(0, Number(process.env.CRM_KEEP_MESSAGES_PER_CHAT || 0)) && Math.max(50, Number(process.env.CRM_KEEP_MESSAGES_PER_CHAT)) } = {}) {
   const file = path.join(path.dirname(dataDir), 'crm-state.json');
   let state = {
@@ -158,6 +158,36 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
     if (chat?.archived && state.messages[jid]) { delete state.messages[jid]; prunedArchived++; }
   }
   if (prunedArchived) console.log('[crm] archived chats pruned=' + prunedArchived);
+  // KERO-ROBO-VARREDURA-20261105 (CEO 05/11: "o robo tem que ser capaz de ver as o.s que jogamos manualmente"):
+  // guarda SO as mensagens ENVIADAS PELA KERO (fromMe) em grupos, inclusive arquivados e as mandadas pelo celular,
+  // por ~62 h (o WhatsApp so apaga para todos ate ~60 h). Mensagens de outras pessoas continuam sem ser guardadas (regra 20/10).
+  const KERO_SENT_TTL_S = 62 * 3600, KERO_SENT_MAX_POR_GRUPO = 300, KERO_SENT_TEXTO = 700;
+  if (!state.keroSent || typeof state.keroSent !== 'object' || Array.isArray(state.keroSent)) state.keroSent = {};
+  const podarKeroSent = (agoraS = Math.floor(Date.now() / 1000)) => {
+    for (const [jid, arr] of Object.entries(state.keroSent)) {
+      const vivo = (Array.isArray(arr) ? arr : []).filter(x => x && Number(x.timestamp) >= agoraS - KERO_SENT_TTL_S);
+      if (vivo.length) state.keroSent[jid] = vivo.slice(-KERO_SENT_MAX_POR_GRUPO); else delete state.keroSent[jid];
+    }
+  };
+  podarKeroSent();
+  const marcarKeroSentApagada = (jid, id) => {
+    const x = (state.keroSent[jid] || []).find(m => m.id === id);
+    if (x && !x.deleted) { x.deleted = true; x.deletedAt = Date.now(); return true; }
+    return false;
+  };
+  // Lista para o robo de varredura: so mensagens da Kero, das ultimas N horas (max 62).
+  const keroSent = ({ sinceHours = 58 } = {}) => {
+    const h = Math.min(62, Math.max(1, Number(sinceHours) || 58));
+    const desde = Math.floor(Date.now() / 1000) - h * 3600;
+    podarKeroSent();
+    const messages = [];
+    for (const [jid, arr] of Object.entries(state.keroSent)) {
+      const chat = state.chats[jid];
+      for (const m of arr) if (Number(m.timestamp) >= desde) messages.push({ jid, id: m.id, fromMe: true, timestamp: m.timestamp, text: m.text, deleted: !!m.deleted, archived: !!chat?.archived });
+    }
+    messages.sort((a, b) => a.timestamp - b.timestamp);
+    return { sinceHours: h, total: messages.length, messages };
+  };
   // KERO 20/10/2026 (CRM etapa 6, enxugar Railway): com o espelho D1 ligado, o histórico completo fica no Cloudflare
   // e o bridge guarda só as últimas N por conversa (CRM_KEEP_MESSAGES_PER_CHAT, mínimo 50). Sem espelho, não poda.
   if (mirror && keepMessagesPerChat > 0) {
@@ -312,6 +342,7 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
       id,
       jid,
       fromMe: !!raw.key.fromMe,
+      origem: raw.key.fromMe ? (raw.origem || (typeof origemDe === 'function' && origemDe(id)) || 'humano') : null, // KERO-ORIGEM-20261108: ia | api | humano (so mensagem nossa)
       participant: raw.key.participant || null,
       pushName: raw.pushName || null,
       timestamp: ts,
@@ -331,6 +362,19 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
         caption: loc.caption || loc.comment || null
       } : null
     };
+
+    // KERO-ROBO-VARREDURA-20261105: lembrar a mensagem da Kero em grupo (so id, hora e texto curto), mesmo arquivado.
+    if (item.fromMe && String(jid).endsWith('@g.us') && !unwrapped?.protocolMessage && ts >= Math.floor(Date.now() / 1000) - KERO_SENT_TTL_S) {
+      const lista = state.keroSent[jid] ||= [];
+      const atual = lista.find(x => x.id === id);
+      const texto = String(item.text || '').slice(0, KERO_SENT_TEXTO);
+      if (atual) { if (texto) atual.text = texto; }
+      else {
+        lista.push({ id, timestamp: ts, text: texto, deleted: false });
+        lista.sort((a, b) => a.timestamp - b.timestamp);
+        if (lista.length > KERO_SENT_MAX_POR_GRUPO) lista.splice(0, lista.length - KERO_SENT_MAX_POR_GRUPO);
+      }
+    }
 
     let idx = -1;
     if (!chat.archived) {
@@ -378,6 +422,7 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
       const jid = key?.remoteJid;
       const id = key?.id;
       if (!jid || !id) continue;
+      marcarKeroSentApagada(jid, id);
       const arr = state.messages[jid] || [];
       const item = arr.find(x => x.id === id);
       if (item) {
@@ -422,6 +467,7 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
       }
 
       if (update.message === null && Number(update.messageStubType) === Number(WAMessageStubType.REVOKE)) {
+        if (marcarKeroSentApagada(jid, id)) changed = true;
         if (item) {
           item.deleted = true;
           item.deletedAt = Date.now();
@@ -698,6 +744,8 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
     resolveSendJid,
     getMessages,
     markReadLocal,
+    keroSent,
+    marcarKeroSentApagada: (jid, id) => { const ok = marcarKeroSentApagada(jid, id); if (ok) touch(); return ok; },
     saveNow
   };
 }

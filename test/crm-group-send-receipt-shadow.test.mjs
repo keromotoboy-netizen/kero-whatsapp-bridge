@@ -33,7 +33,7 @@ function fixture(responseFor = jid => ({key:{id:jid===a?'3EB0AAAA12345678':'3EB0
      persisted = JSON.parse(JSON.stringify(state));
    }
  };
- const sandbox = {sock,status:'open',CRM,createHash,resolveOutboundJid:async x=>x};
+ const sandbox = {sock,status:'open',CRM,createHash,resolveOutboundJid:async x=>x,marcarOrigem:()=>{}};
  createContext(sandbox);
  new Script(fn).runInContext(sandbox);
  return {send:sandbox.sendCrmText,calls,messages,saves,state,get persisted(){return persisted}};

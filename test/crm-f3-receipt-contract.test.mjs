@@ -31,7 +31,7 @@ function fixture({savedState=null,failSaveNumber=0,sendError=false,wrongGroup=fa
   if(sendError)throw Error('QA_LOST_ACK');
   return {key:{remoteJid:wrongGroup?B:jid,fromMe:true,id:jid===A?'3EB0F3CONTRACTA123':'3EB0F3CONTRACTB123'},messageTimestamp:10,message:{conversation:payload.text}};
  }};
- const sandbox={sock,status:'open',CRM,createHash,resolveOutboundJid:async x=>x};
+ const sandbox={sock,status:'open',CRM,createHash,resolveOutboundJid:async x=>x,marcarOrigem:()=>{}};
  createContext(sandbox);
  new Script(source.slice(sendStart,sendEnd)+'\nthis.send=sendCrmText;').runInContext(sandbox);
  const app={post:(url,secure,fn)=>paths.set(url,fn)};

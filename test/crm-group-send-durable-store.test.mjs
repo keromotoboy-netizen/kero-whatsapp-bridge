@@ -26,7 +26,7 @@ test('group message id is on disk before /crm/send helper responds; survives CRM
   calls.push(target);
   return {key:{id,remoteJid:target,fromMe:true},messageTimestamp:Math.floor(Date.now()/1000),message:{conversation:text}};
  }};
- const sandbox={sock,status:'open',CRM:crm,createHash,resolveOutboundJid:async x=>x};
+ const sandbox={sock,status:'open',CRM:crm,createHash,resolveOutboundJid:async x=>x,marcarOrigem:()=>{}};
  createContext(sandbox);
  new Script(sendSource).runInContext(sandbox);
  try{
@@ -47,7 +47,7 @@ test('group message id is on disk before /crm/send helper responds; survives CRM
 });
 
 function launchOfflineSender(crm,sendMessage) {
- const sandbox={sock:{sendMessage},status:'open',CRM:crm,createHash,resolveOutboundJid:async x=>x};
+ const sandbox={sock:{sendMessage},status:'open',CRM:crm,createHash,resolveOutboundJid:async x=>x,marcarOrigem:()=>{}};
  createContext(sandbox);
  new Script(sendSource).runInContext(sandbox);
  return sandbox.send;
