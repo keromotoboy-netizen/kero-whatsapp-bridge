@@ -9,7 +9,7 @@ import makeWASocket, {
 import QRCode from 'qrcode';
 import pino from 'pino';
 import fs from 'node:fs';
-import { createHmac } from 'node:crypto';
+import { createHmac, createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createCrmStore } from './crm-store.mjs';
@@ -21,6 +21,8 @@ import { selectAuthDirectory } from './auth-directory.mjs';
 import { maintenanceMutationAllowed, scheduledMaintenanceAllowed } from './maintenance-permissions.mjs';
 import { mountArchivedGroupCleanup } from './archived-group-cleanup.mjs';
 import { createCrmArchivedCleanup } from './archived-cleanup-service.mjs';
+import { mountCrmGroupStar } from './crm-group-star.mjs';
+import { mountCrmGroupDelete } from './crm-group-delete.mjs';
 
 
 // KERO-CEO-PAUSE-UNTIL-ORDER-20261104-v1: no timer or automatic release.
@@ -200,7 +202,20 @@ async function resolveOutboundJid(jid) {
   return CRM.resolveSendJid(value);
 }
 
-async function sendCrmText(jid, text) {
+// PR30 (B2/N3): codigo curto e sem dados (nunca JID, caminho ou pilha). Mantem 'rate-overlimit' e 'timeout'
+// para a trava LIMITADO do disparo e o retorno a ponte reserva continuarem funcionando.
+export function sanitizeSendError(error) {
+  const raw = String(error?.message || error || '').toLowerCase();
+  if (/rate[-_ ]?overlimit|\b429\b|too many/.test(raw)) return 'rate-overlimit';
+  if (/timed?[-_ ]?out|timeout|etimedout/.test(raw)) return 'timeout';
+  if (/forbidden|\b403\b/.test(raw)) return 'forbidden';
+  if (/not[-_ ]?authorized|\b401\b/.test(raw)) return 'not-authorized';
+  if (/connection (closed|lost)|whatsapp_not_connected/.test(raw)) return 'whatsapp_not_connected';
+  if (/^[a-z0-9_:-]{3,60}$/.test(raw)) return raw;
+  return 'whatsapp_send_failed';
+}
+
+async function sendCrmText(jid, text, dispatchKey = null) {
   const value = String(jid || '');
   const message = String(text || '').trim();
   if (!value || !message) throw new Error('jid_and_text_required');
@@ -211,9 +226,89 @@ async function sendCrmText(jid, text) {
     throw new Error('contact_number_still_syncing');
   }
 
-  const sent = await sock.sendMessage(targetJid, { text: message });
-  if (sent) { marcarOrigem(sent); CRM.upsertMessage(sent); }
-  return { ok: true, messageId: sent?.key?.id || null, resolved: targetJid !== value };
+  // Group sends must not report a usable receipt until its exact group+id is on disk.
+  // This is AFTER the external effect; any uncertainty must never trigger a blind resend.
+  const group = targetJid.endsWith('@g.us');
+  // Optional F3 command identity; old callers remain unchanged until coordinated.
+  const hasDispatchKey = dispatchKey != null;
+  if (group && hasDispatchKey && (typeof dispatchKey !== 'string' ||
+      !/^[A-Za-z0-9_.:-]{8,128}$/.test(dispatchKey))) {
+    return { ok: false, messageId: null, resolved: targetJid !== value, sent: false,
+      outcome: 'REJECTED', retry: false, httpStatus: 400, error: 'invalid_group_dispatch_key' };
+  }
+  const receiptKey = group && hasDispatchKey
+    ? createHash('sha256').update(JSON.stringify([targetJid, dispatchKey])).digest('hex') : null;
+  const payloadDigest = receiptKey ? createHash('sha256').update(message).digest('hex') : null;
+  // Reservas no indice duravel e limitado (crm-own-ops.json), fora do estado que e podado/arquivado (M2/N1).
+  const ops = CRM.ops;
+  if (receiptKey) {
+    const existing = ops.reservation(receiptKey);
+    if (existing) {
+      if (existing.payloadDigest !== payloadDigest) {
+        return { ok: false, messageId: null, resolved: targetJid !== value, sent: false,
+          outcome: 'REJECTED', retry: false, httpStatus: 409, error: 'group_dispatch_key_conflict' };
+      }
+      // PERSISTED ja foi gravado em disco depois do envio: e a prova, mesmo apos poda/arquivamento (N2).
+      const previouslyRecorded = existing.phase === 'PERSISTED' && !!existing.messageId;
+      if (previouslyRecorded) return { ok: true, messageId: existing.messageId,
+        resolved: targetJid !== value, receiptPersisted: true, duplicateSuppressed: true };
+      // Crash before ACK, ambiguous socket outcome, or missing local evidence.
+      return { ok: false, messageId: existing.messageId || null,
+        resolved: targetJid !== value, outcome: 'UNKNOWN', retry: false,
+        duplicateSuppressed: true, error: 'group_dispatch_already_reserved' };
+    }
+    ops.reserve(receiptKey, { phase: 'RESERVED', payloadDigest, groupJid: targetJid });
+    try { ops.saveStrict(); } catch {
+      ops.dropReservation(receiptKey); // An uncertain file write never authorizes a send.
+      return { ok: false, messageId: null, resolved: targetJid !== value, sent: false,
+        outcome: 'REJECTED', retry: false, httpStatus: 503, error: 'group_dispatch_reservation_not_durable' };
+    }
+  }
+  let sent;
+  try {
+    sent = await sock.sendMessage(targetJid, { text: message });
+  } catch (error) {
+    // Privado e chamadores antigos (sem dispatchKey): mesma excecao de antes -> HTTP 5xx com o motivo,
+    // assim a trava LIMITADO (pausa 10 min) e a volta para a ponte reserva continuam valendo.
+    if (!group || !receiptKey) throw error;
+    const cause = sanitizeSendError(error);
+    ops.updateReservation(receiptKey, { phase: 'UNKNOWN', cause });
+    try { ops.saveStrict(); } catch {}
+    return { ok: false, messageId: null, resolved: targetJid !== value,
+      outcome: 'UNKNOWN', retry: false, error: 'group_send_ack_unknown', cause,
+      limited: cause === 'rate-overlimit' || cause === 'forbidden' };
+  }
+  if (!group) {
+    if (sent) { marcarOrigem(sent); CRM.upsertMessage(sent); }
+    return { ok: true, messageId: sent?.key?.id || null, resolved: targetJid !== value };
+  }
+  const id = typeof sent?.key?.id === 'string' && sent.key.id.length >= 8 ? sent.key.id : null;
+  // Never associate a receipt with the wrong group or an incoming/non-owned message.
+  if (!id || sent?.key?.remoteJid !== targetJid || sent?.key?.fromMe !== true) {
+    return { ok: false, messageId: id, resolved: targetJid !== value,
+      outcome: 'UNKNOWN', retry: false, error: 'group_send_reference_unknown' };
+  }
+  try {
+    marcarOrigem(sent);
+    CRM.upsertMessage(sent);
+    // Indice proprio: registra mesmo com o grupo arquivado (B1).
+    const recorded = ops.record(targetJid, id, { participant: sent?.key?.participant || null,
+      timestamp: Number(sent?.messageTimestamp) || Math.floor(Date.now() / 1000) });
+    if (!recorded) throw new Error('group_send_reference_missing_from_store');
+    if (receiptKey) ops.updateReservation(receiptKey, { phase: 'PERSISTED', messageId: id, persistedAt: Date.now() });
+    ops.saveStrict(); // Gravacao estrita so do arquivo pequeno antes de responder (M1).
+  } catch {
+    // Failed writes invalidate even an in-memory success; never report a phantom receipt.
+    if (receiptKey) {
+      ops.updateReservation(receiptKey, { phase: 'UNKNOWN', messageId: id });
+      try { ops.saveStrict(); } catch {}
+    }
+    // External send may have happened. No 5xx/no automatic retry on lost persistence.
+    return { ok: false, messageId: id, resolved: targetJid !== value,
+      outcome: 'UNKNOWN', retry: false, error: 'group_send_receipt_not_persisted' };
+  }
+  return { ok: true, messageId: id, resolved: targetJid !== value,
+    receiptPersisted: true };
 }
 
 // KERO-PONTE-PARIDADE-31-10-20261105-v1: cartao Pix (da ponte de 31/10)
@@ -521,19 +616,35 @@ app.post('/crm/send', secure, async (req, res) => {
   if (!jid || !text) return res.status(400).json({ error: 'jid_and_text_required' });
 
   try {
-    res.json(await sendCrmText(jid, text));
+    const receipt = await sendCrmText(jid, text, req.body?.dispatchKey);
+    // 202 UNKNOWN explicitly blocks a retry; it is NOT a delivery receipt.
+    const { httpStatus, ...body } = receipt;
+    res.status(receipt.outcome === 'REJECTED' ? (httpStatus || 409)
+      : receipt.ok === false && receipt.outcome === 'UNKNOWN' ? 202 : 200).json(body);
   } catch (error) {
-    const code = error?.message === 'whatsapp_not_connected' || error?.message === 'contact_number_still_syncing'
+    const motivo = sanitizeSendError(error);
+    const code = motivo === 'whatsapp_not_connected' || motivo === 'contact_number_still_syncing'
       ? 409
       : 502;
-    console.error('[crm] send failed', {
-      jid,
-      message: error?.message || String(error)
-    });
-    res.status(code).json({
-      error: error?.message || 'whatsapp_send_failed'
-    });
+    console.error('[crm] send failed', { motivo });
+    res.status(code).json({ error: motivo });
   }
+});
+
+// Manual favorites: each sent group message is starred by its own messageId.
+// No publishing, deleting, reactions, photos or background scheduler here.
+mountCrmGroupStar(app, secure, {
+  getSocket: () => sock,
+  isConnected: () => status === 'open',
+  crm: CRM
+});
+
+// Manual delete-for-everyone, scoped to existing own group messages only.
+// Result is PENDING until a WhatsApp revoke event is observed; no retry.
+mountCrmGroupDelete(app, secure, {
+  getSocket: () => sock,
+  isConnected: () => status === 'open',
+  crm: CRM
 });
 
 app.post('/crm/send-media', secure, async (req, res) => {
@@ -601,15 +712,9 @@ app.post('/crm/send-media', secure, async (req, res) => {
     if (sent) { marcarOrigem(sent); CRM.upsertMessage(sent); }
     res.json({ ok: true, messageId: sent?.key?.id || null, resolved: targetJid !== jid });
   } catch (error) {
-    console.error('[crm] media send failed', {
-      jid,
-      kind,
-      message: error?.message || String(error)
-    });
-    res.status(502).json({
-      error: 'whatsapp_send_failed',
-      detail: error?.message || String(error)
-    });
+    const motivo = sanitizeSendError(error);
+    console.error('[crm] media send failed', { kind, motivo });
+    res.status(502).json({ error: 'whatsapp_send_failed', detail: motivo });
   }
 });
 
