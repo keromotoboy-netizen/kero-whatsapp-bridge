@@ -172,3 +172,21 @@ test('conversas arquivadas nao guardam mensagens e sao podadas ao carregar', () 
   assert.equal(reloaded.getMessages(arquivada, { limit: 50 }).total, 0);
   assert.equal(reloaded.getMessages(ativa, { limit: 50 }).total, 1);
 });
+
+test('KERO-BUSCA-CARTOES-20261109: cartao com sufixo :0 junta no numero base; busca por nome salvo, apelido e numero', () => {
+  const { store } = makeStore();
+  const base = '5513991234567@s.whatsapp.net', dev = '5513991234567:0@s.whatsapp.net';
+  store.upsertContact({ id: base, name: 'Cliente João Esquina Brasil', notify: 'Nil' });
+  store.upsertChat({ id: base, archived: true, unreadCount: 0, conversationTimestamp: 1000 });
+  store.upsertMessage(message({ id: 'velha1', jid: base, ts: 1000, text: 'pedido antigo' }));
+  store.upsertMessage(message({ id: 'nova1', jid: dev, ts: Math.floor(Date.now() / 1000), text: 'Abre as 8 fecha 12h' }), { countUnread: true });
+  const chats = store.snapshot({ archived: false, search: '', limit: 0 }).chats.filter(c => c.id.startsWith('551399123'));
+  assert.equal(chats.length, 1, 'um cartao so');
+  assert.equal(chats[0].id, base);
+  assert.equal(chats[0].name, 'Cliente João Esquina Brasil');
+  for (const q of ['esquina', 'Joao Esquina', 'nil', '99123-4567', '13991234567']) {
+    assert.equal(store.snapshot({ archived: false, search: q, limit: 0 }).chats.filter(c => c.id === base).length, 1, 'busca: ' + q);
+  }
+  const ids = store.getMessages(base, { limit: 50 }).messages.map(m => m.id);
+  assert.ok(ids.includes('nova1'), 'mensagem da variante :0 aparece no numero base'); // conversa arquivada nao guarda mensagem local (regra antiga)
+});

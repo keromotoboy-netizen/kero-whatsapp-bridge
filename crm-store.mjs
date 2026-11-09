@@ -219,7 +219,13 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
     saveTimer = setTimeout(saveNow, 250);
   };
 
-  const contactFor = jid => {
+  // KERO-BUSCA-CARTOES-20261109: mensagem nova chega com sufixo de aparelho (5511...:0@s.whatsapp.net) e criava um 2o cartao
+  // sem o nome salvo. semAparelho junta tudo no numero base.
+  const semAcento = t => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+  const semAparelho = jid => String(jid || '').replace(/:\d+@(s\.whatsapp\.net|lid)$/, '@$1');
+  const contactFor = jid0 => {
+    const jid = semAparelho(jid0);
+    if (jid !== jid0 && !state.contacts[jid] && state.contacts[jid0]) return state.contacts[jid0];
     const mapped = state.lidMap[jid];
     if (String(jid || '').endsWith('@lid') && mapped && String(mapped).endsWith('@s.whatsapp.net')) {
       return state.contacts[mapped] || state.contacts[jid] || {};
@@ -535,7 +541,7 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
   };
 
   const canonicalJid = jid => {
-    const value = String(jid || '');
+    const value = semAparelho(jid);
     if (value.endsWith('@lid')) {
       const mapped = state.lidMap[value];
       if (mapped && String(mapped).endsWith('@s.whatsapp.net')) return String(mapped);
@@ -578,7 +584,10 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
         return {
           id,
           name: chatName(id),
-          archived: !!canonical?.archived,
+          // em duvida, MOSTRA: cartao mais novo nao arquivado (mensagem nova desarquiva no celular) vence o arquivado antigo
+          archived: !!canonical?.archived && !members.some(m => m !== canonical && !m.archived &&
+            Number(m.lastMessageTimestamp || m.conversationTimestamp || 0) > Number(canonical?.lastMessageTimestamp || canonical?.conversationTimestamp || 0)),
+          _busca: semAcento([chatName(id), contact?.name, contact?.notify, contact?.verifiedName, ...members.map(m => m.name || m.pushName), id.replace(/@.*/, '')].filter(Boolean).join(' ')),
           unreadCount,
           lastMessage: latest?.lastMessage || '',
           lastMessageTimestamp: Number(latest?.lastMessageTimestamp || latest?.conversationTimestamp || 0),
@@ -590,7 +599,8 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
       })
       .filter(c => !!c.archived === !!archived)
       .filter(c => !labelId || c.labels.includes(labelId))
-      .filter(c => !q || (c.name + ' ' + c.id + ' ' + c.lastMessage).toLowerCase().includes(q))
+      .filter(c => !q || (c._busca + ' ' + semAcento(c.lastMessage)).includes(semAcento(q)) || (/^\d{4,}$/.test(q.replace(/\D/g, '')) && c.id.replace(/\D/g, '').includes(q.replace(/\D/g, ''))))
+      .map(({ _busca, ...c }) => c)
       .sort((a,b) => b.lastMessageTimestamp - a.lastMessageTimestamp);
   };
 
@@ -610,7 +620,9 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
 
   const getMessages = (jid, options = {}) => {
     const alias = state.lidMap[jid];
-    const ids = [...new Set([jid, alias].filter(Boolean))];
+    const base = semAparelho(jid);
+    const variantes = Object.keys(state.messages).filter(k => k !== jid && semAparelho(k) === base);
+    const ids = [...new Set([jid, base, alias, ...variantes].filter(Boolean))];
     const byId = new Map();
 
     for (const id of ids) {
