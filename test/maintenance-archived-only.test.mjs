@@ -83,3 +83,21 @@ test('temporary labels are removed from contacts AND groups without deleting cha
  assert.deepEqual(f.CRM.state.chatLabels['direct@s.whatsapp.net'],[]);
  assert.equal(f.events.filter(z=>z.operation==='chatModify').every(z=>Object.keys(z.arg).join(',')==='removeChatLabel'),true);
 });
+test('KERO-LIMPEZA-ARQUIVADOS-20261109: protegidos, etiqueta Grupos com clientes e disparo recente nunca sao limpos', async()=>{
+ const f=fixture();
+ f.CRM.state.groups['g-time@g.us']={id:'g-time@g.us',subject:'🔱KERO🔱Time Atendimento'};
+ f.CRM.state.groups['g-label@g.us']={id:'g-label@g.us',subject:'Qualquer'};
+ f.CRM.state.groups['g-disp@g.us']={id:'g-disp@g.us',subject:'Motoboys ABC'};
+ for(const j of ['g-time@g.us','g-label@g.us','g-disp@g.us']) f.CRM.state.chats[j]={archived:true};
+ f.CRM.state.labels['50']={id:'50',name:'GRUPOS COM CLIENTES',deleted:false};
+ f.CRM.state.chatLabels['g-label@g.us']=['50'];
+ f.CRM.state.keroSent={'g-disp@g.us':[{id:'x',timestamp:Math.floor(Date.now()/1000)-600,deleted:false}]};
+ const x=compile('const isArchivedGroup','async function runKeroMaintenance',f);
+ const d=await x.clearArchivedGroups(false);
+ const mexidos=f.events.filter(z=>z.operation==='chatModify').map(z=>z.jid);
+ for(const j of ['g-time@g.us','g-label@g.us','g-disp@g.us']) assert.ok(!mexidos.includes(j), j);
+ assert.equal(d.find(z=>z.id==='g-time@g.us').skipped,'protegido');
+ assert.equal(d.find(z=>z.id==='g-label@g.us').skipped,'etiqueta_grupos_com_clientes');
+ assert.equal(d.find(z=>z.id==='g-disp@g.us').skipped,'disparo_recente');
+ assert.ok(mexidos.includes('g-archived@g.us'));
+});
