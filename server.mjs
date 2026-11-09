@@ -762,7 +762,11 @@ app.post('/crm/archive', secure, async (req, res) => {
   if (!sock || status !== 'open') return res.status(409).json({ error: 'whatsapp_not_connected' });
   try {
     const targetJid = await resolveOutboundJid(jid);
-    const ult = ([targetJid, jid].flatMap(j => CRM.getMessages(j, { limit: 5 }).messages || []).sort((a, b) => Number(b.timestamp) - Number(a.timestamp)))[0];
+    // CEO 09/11: quem acabou de enviar informa o id da propria mensagem (o historico local pode nao ter a conversa)
+    const idDado = /^[A-Za-z0-9_-]{8,128}$/.test(String(req.body?.id || '')) ? String(req.body.id) : null;
+    const tsDado = Number(req.body?.timestamp) > 1e9 ? Math.floor(Number(req.body.timestamp)) : Math.floor(Date.now() / 1000);
+    const ult = idDado ? { id: idDado, fromMe: true, timestamp: tsDado }
+      : ([targetJid, jid].flatMap(j => CRM.getMessages(j, { limit: 5 }).messages || []).sort((a, b) => Number(b.timestamp) - Number(a.timestamp)))[0];
     if (!ult) return res.status(422).json({ error: 'sem_mensagem', message: 'conversa sem mensagem salva' });
     const archive = req.body?.archive !== false;
     await sock.chatModify({ archive, lastMessages: [{ key: { remoteJid: targetJid, id: ult.id, fromMe: !!ult.fromMe }, messageTimestamp: Number(ult.timestamp) }] }, targetJid);
