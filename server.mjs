@@ -308,7 +308,7 @@ async function startSession(mode, phone = null) {
       auth: state,
       version,
       logger: pino({ level: 'warn' }),
-      browser: ['Kero CRM', 'Chrome', '1.0.0'],
+      browser: ['Windows', 'Chrome', '10.0'], // CEO 09/11: aparelho conectado com nome comum, nunca robo/IA/CRM
       markOnlineOnConnect: false,
       syncFullHistory: true,
       shouldSyncHistoryMessage: () => true
