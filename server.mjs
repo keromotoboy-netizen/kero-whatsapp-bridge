@@ -939,8 +939,9 @@ async function removeTemporaryLabels(dryRun=false){
 const isArchivedGroup = g => !!g?.id?.endsWith('@g.us') && CRM.state.chats?.[g.id]?.archived === true;
 // KERO-LIMPEZA-ARQUIVADOS-20261109 (CEO 09/11): igual ao app "Limpar conversas" — limpa a conversa INTEIRA de cada grupo arquivado.
 // Antes: so limpava mensagens guardadas aqui, mas o store apaga as mensagens de conversa arquivada -> limpava 0 todo dia.
-// Nunca: Time Atendimento, SuperGrupo/Apoio, Reuniao de ADMs, Ensinamentos, etiqueta 'Grupos com clientes' e grupo com
-// disparo nosso nos ultimos 30 min. Nunca desarquiva, sai ou apaga grupo.
+// CEO 09/11 15h40: SO grupo de motoboy, motorista e localizacao (isProfessionalGroup: etiquetas 1,50/2,00/Min20/Carros/Encaixe ou nome).
+// Grupo com cliente NUNCA. Nunca tambem: Time Atendimento, SuperGrupo/Apoio, Reuniao de ADMs, Ensinamentos, etiqueta 'Grupos com
+// clientes' e grupo com disparo nosso nos ultimos 30 min. Nunca desarquiva, sai ou apaga grupo.
 const LIMPEZA_PROTEGIDOS = /time atendimento|supergrupo|apoio|reuniao de adms|ensinamentos/i;
 const temEtiquetaDeCliente = g => {
   const byId = new Map(Object.values(CRM.state.labels || {}).filter(x=>!x.deleted).map(x=>[String(x.id), norm(x.name)]));
@@ -949,6 +950,7 @@ const temEtiquetaDeCliente = g => {
 function motivoParaNaoLimpar(g, agora=Date.now()){
   if(LIMPEZA_PROTEGIDOS.test(norm(g?.subject))) return 'protegido';
   if(temEtiquetaDeCliente(g)) return 'etiqueta_grupos_com_clientes';
+  if(!isProfessionalGroup(g)) return 'nao_e_grupo_de_motoboy';
   if((CRM.state.keroSent?.[g.id] || []).some(m=>!m.deleted && agora - Number(m.timestamp)*1000 < 30*60e3)) return 'disparo_recente';
   return null;
 }

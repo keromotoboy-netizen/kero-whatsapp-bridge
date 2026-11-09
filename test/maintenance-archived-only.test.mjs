@@ -38,11 +38,12 @@ function fixture(){
 function compile(sourceStart,sourceEnd,fixture,extra={}){
  const a=src.indexOf(sourceStart),b=src.indexOf(sourceEnd,a+1);
  assert.ok(a>=0&&b>a);
- return new Function('CRM','sock','sleep','TEMP_LABEL_NAMES','labelsByName','norm',src.slice(a,b)+';return {clearArchivedGroups:typeof clearArchivedGroups==="function"?clearArchivedGroups:undefined,removeTemporaryLabels:typeof removeTemporaryLabels==="function"?removeTemporaryLabels:undefined,isArchivedGroup:typeof isArchivedGroup==="function"?isArchivedGroup:undefined};')(
+ return new Function('CRM','sock','sleep','TEMP_LABEL_NAMES','labelsByName','norm','isProfessionalGroup',src.slice(a,b)+';return {clearArchivedGroups:typeof clearArchivedGroups==="function"?clearArchivedGroups:undefined,removeTemporaryLabels:typeof removeTemporaryLabels==="function"?removeTemporaryLabels:undefined,isArchivedGroup:typeof isArchivedGroup==="function"?isArchivedGroup:undefined};')(
  fixture.CRM,fixture.sock,fixture.sleep,
  new Set(['📌Cliente do dia','Pagamento de Motoboy/Motorista']),
  ()=>new Map(Object.values(fixture.CRM.state.labels).filter(x=>!x.deleted).map(x=>[String(x.name).toLowerCase(),x.id])),
- v=>String(v||'').trim()
+ v=>String(v||'').trim(),
+ extra.isProfessionalGroup||(g=>/profissional|motoboy|motorista|localiza/i.test(String(g?.subject||''))&&!/cliente/i.test(String(g?.subject||'')))
  );
 }
 test('only archived group messages are cleared; non-archived are untouched',async()=>{
@@ -52,12 +53,13 @@ test('only archived group messages are cleared; non-archived are untouched',asyn
  const data=await x.clearArchivedGroups(false);
  assert.deepEqual(data.map(z=>z.id).sort(),['g-archived@g.us','g-client@g.us']);
  const modifications=f.events.filter(z=>z.operation==='chatModify');
- assert.deepEqual(modifications.map(z=>z.jid).sort(),['g-archived@g.us','g-client@g.us']);
+ assert.deepEqual(modifications.map(z=>z.jid).sort(),['g-archived@g.us']);
 });
-test('archived client groups are included regardless of name or labels',async()=>{
+test('CEO 09/11: archived client groups are NEVER cleared (only motoboy/motorista/localizacao)',async()=>{
  const f=fixture(),x=compile('const isArchivedGroup','async function runKeroMaintenance',f);
  const d=await x.clearArchivedGroups(false);
- assert.ok(d.some(z=>z.id==='g-client@g.us'&&z.cleared===1));
+ assert.ok(d.some(z=>z.id==='g-client@g.us'&&z.cleared===0&&z.skipped==='nao_e_grupo_de_motoboy'));
+ assert.ok(!f.events.some(z=>z.operation==='chatModify'&&z.jid==='g-client@g.us'));
  assert.ok(!d.some(z=>z.id==='g-active@g.us'));
 });
 test('cleaning messages never deletes or leaves any group and dryRun never mutates',async()=>{
