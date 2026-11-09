@@ -755,6 +755,23 @@ app.post('/crm/save-contact', secure, async (req, res) => {
   }
 });
 
+// CEO 09/11/2026: arquivar conversa PRIVADA depois de um envio (ex.: disparo Dunelli). Grupos nunca.
+app.post('/crm/archive', secure, async (req, res) => {
+  const jid = String(req.body?.jid || '');
+  if (!jid || /@g\.us$/.test(jid)) return res.status(400).json({ error: 'jid_privado_required' });
+  if (!sock || status !== 'open') return res.status(409).json({ error: 'whatsapp_not_connected' });
+  try {
+    const targetJid = await resolveOutboundJid(jid);
+    const ult = ([targetJid, jid].flatMap(j => CRM.getMessages(j, { limit: 5 }).messages || []).sort((a, b) => Number(b.timestamp) - Number(a.timestamp)))[0];
+    if (!ult) return res.status(422).json({ error: 'sem_mensagem', message: 'conversa sem mensagem salva' });
+    const archive = req.body?.archive !== false;
+    await sock.chatModify({ archive, lastMessages: [{ key: { remoteJid: targetJid, id: ult.id, fromMe: !!ult.fromMe }, messageTimestamp: Number(ult.timestamp) }] }, targetJid);
+    res.json({ ok: true, archived: archive });
+  } catch (error) {
+    res.status(502).json({ error: 'archive_failed', message: error?.message || String(error) });
+  }
+});
+
 // CEO 23/10/2026: a IA poe/tira uma conversa de uma etiqueta so quando a equipe manda (Agendado, Devedores sanados).
 // Faturados, Grupos com clientes e etiquetas dos grupos de motoboy nunca sao tocadas por aqui.
 const LABEL_PROTEGIDA = /faturad|grupos? com clientes?|grupos? 1[,.]50|grupos? 2[,.]00|encaixes? acima|carros? ?& ?utilit|min\.? ?20/i;
