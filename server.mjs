@@ -941,18 +941,35 @@ async function removeTemporaryLabels(dryRun=false){
 }
 // CEO 16/10/2026: clear ONLY the messages of archived groups; never delete/leave groups.
 const isArchivedGroup = g => !!g?.id?.endsWith('@g.us') && CRM.state.chats?.[g.id]?.archived === true;
+// KERO-LIMPEZA-ARQUIVADOS-20261109 (CEO 09/11): igual ao app "Limpar conversas" — limpa a conversa INTEIRA de cada grupo arquivado.
+// Antes: so limpava mensagens guardadas aqui, mas o store apaga as mensagens de conversa arquivada -> limpava 0 todo dia.
+// CEO 09/11 15h40: SO grupo de motoboy, motorista e localizacao (isProfessionalGroup: etiquetas 1,50/2,00/Min20/Carros/Encaixe ou nome).
+// Grupo com cliente NUNCA. Nunca tambem: Time Atendimento, SuperGrupo/Apoio, Reuniao de ADMs, Ensinamentos, etiqueta 'Grupos com
+// clientes' e grupo com disparo nosso nos ultimos 30 min. Nunca desarquiva, sai ou apaga grupo.
+const LIMPEZA_PROTEGIDOS = /time atendimento|supergrupo|apoio|reuniao de adms|ensinamentos/i;
+const temEtiquetaDeCliente = g => {
+  const byId = new Map(Object.values(CRM.state.labels || {}).filter(x=>!x.deleted).map(x=>[String(x.id), norm(x.name)]));
+  return (CRM.state.chatLabels?.[g.id] || []).map(id=>byId.get(String(id))).filter(Boolean).some(n=>/grupos? com clientes?/i.test(n));
+};
+function motivoParaNaoLimpar(g, agora=Date.now()){
+  if(LIMPEZA_PROTEGIDOS.test(norm(g?.subject))) return 'protegido';
+  if(temEtiquetaDeCliente(g)) return 'etiqueta_grupos_com_clientes';
+  if(!isProfessionalGroup(g)) return 'nao_e_grupo_de_motoboy';
+  if((CRM.state.keroSent?.[g.id] || []).some(m=>!m.deleted && agora - Number(m.timestamp)*1000 < 30*60e3)) return 'disparo_recente';
+  return null;
+}
 async function clearArchivedGroups(dryRun=false){
   const results=[];
   for(const g of Object.values(CRM.state.groups||{})){
     if(!isArchivedGroup(g)) continue;
-    const msgs=(CRM.getMessages(g.id,{limit:500}).messages||[]).filter(m=>!m.deleted);
-    if(!msgs.length){results.push({id:g.id,name:g.subject,cleared:0});continue;}
+    const pulo=motivoParaNaoLimpar(g);
+    if(pulo){results.push({id:g.id,name:g.subject,cleared:0,skipped:pulo});continue;}
     if(!dryRun){
-      const payload=msgs.map(m=>({id:m.id,fromMe:!!m.fromMe,timestamp:String(m.timestamp)}));
-      await sock.chatModify({ clear:{messages:payload} }, g.id);
-      await sleep(250);
+      try { await sock.chatModify({ clear:true }, g.id); }
+      catch(error){ results.push({id:g.id,name:g.subject,cleared:0,error:String(error?.message||error).slice(0,80)}); continue; }
+      await sleep(400);
     }
-    results.push({id:g.id,name:g.subject,cleared:msgs.length});
+    results.push({id:g.id,name:g.subject,cleared:1});
   }
   return results;
 }
