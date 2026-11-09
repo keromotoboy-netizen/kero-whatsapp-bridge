@@ -289,8 +289,9 @@ export function createAiEngine({
           suggestionId: item.id
         });
       } else {
-        await sendText(jid, item.suggestion);
-        item.status = 'auto_sent';
+        // PR30 (B3): {ok:false} (ex. grupo com resultado incerto) NAO e envio confirmado.
+        const enviado = await sendText(jid, item.suggestion);
+        item.status = enviado && enviado.ok === false ? 'auto_send_unknown' : 'auto_sent';
         item.reviewedAt = new Date().toISOString();
         audit({
           type: 'automatic_sent',

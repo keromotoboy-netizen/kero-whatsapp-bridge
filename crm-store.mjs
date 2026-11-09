@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { WAMessageStubType } from 'baileys';
+import { createOwnOps } from './crm-own-ops.mjs';
 
 const configuredMessageCap = Number(process.env.CRM_MAX_MESSAGES_PER_CHAT || 0);
 const MAX_MESSAGES_PER_CHAT =
@@ -153,6 +154,8 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
   } catch (error) {
     console.error('[crm] failed to load state', error?.message || error);
   }
+  // PR30: indice duravel das mensagens proprias em grupo (independe de arquivamento/poda).
+  const ops = createOwnOps(dataDir);
   let prunedArchived = 0;
   for (const [jid, chat] of Object.entries(state.chats || {})) {
     if (chat?.archived && state.messages[jid]) { delete state.messages[jid]; prunedArchived++; }
@@ -208,9 +211,10 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
       fs.writeFileSync(file + '.tmp', JSON.stringify(state));
       fs.renameSync(file + '.tmp', file);
     } catch (error) {
-      console.error('[crm] failed to save state', error?.message || error);
+      console.error('[crm] failed to save state', error?.code || 'write_error');
       if (strict) throw error;
     }
+    try { ops.saveStrict(); } catch (error) { console.error('[crm-ops] failed to save', error?.code || 'write_error'); }
   };
 
   const touch = () => {
@@ -364,6 +368,7 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
     };
 
     // KERO-ROBO-VARREDURA-20261105: lembrar a mensagem da Kero em grupo (so id, hora e texto curto), mesmo arquivado.
+    if (item.fromMe && String(jid).endsWith('@g.us') && !unwrapped?.protocolMessage) ops.record(jid, id, { participant: raw.key.participant || null, timestamp: ts });
     if (item.fromMe && String(jid).endsWith('@g.us') && !unwrapped?.protocolMessage && ts >= Math.floor(Date.now() / 1000) - KERO_SENT_TTL_S) {
       const lista = state.keroSent[jid] ||= [];
       const atual = lista.find(x => x.id === id);
@@ -436,7 +441,7 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
 
   const handleMessageUpdates = updates => {
     let changed = false;
-    const actionReceipts = new Set();
+    let opsChanged = false;
     for (const entry of updates || []) {
       const key = entry?.key;
       const update = entry?.update || {};
@@ -449,14 +454,10 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
       // WhatsApp can report SERVER_ACK(1), DELIVERY_ACK(2), READ(3), PLAYED(4)
       // asynchronously. Only store monotonic numeric status; never log message data.
       // Baileys app-state sync for a star/unstar action on one message.
-      if (item && typeof update.starred === 'boolean' &&
-          (item.starred !== update.starred || (update.starred && !item.starObservedAt))) {
-        item.starred = update.starred;
-        item.starObservedAt = update.starred ? Date.now() : null;
-        item.starReceiptDurable = false;
-        item.starUpdatedAt = Date.now();
-        actionReceipts.add(item);
-        changed = true;
+      // Vale tambem para grupo arquivado / mensagem podada: o indice proprio nao depende de state.messages.
+      if (typeof update.starred === 'boolean') {
+        if (ops.observeStar(jid, id, update.starred)) opsChanged = true;
+        if (item && item.starred !== update.starred) { item.starred = update.starred; changed = true; }
       }
       if (item && Number.isInteger(update.status) && update.status >= 0 && update.status <= 4) {
         const previous = Number.isInteger(item.deliveryStatus) ? item.deliveryStatus : -1;
@@ -468,13 +469,11 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
 
       if (update.message === null && Number(update.messageStubType) === Number(WAMessageStubType.REVOKE)) {
         if (marcarKeroSentApagada(jid, id)) changed = true;
+        if (ops.observeRevoke(jid, id)) opsChanged = true;
         if (item) {
           item.deleted = true;
           item.deletedAt = Date.now();
           item.deletedForEveryone = true;
-          item.deleteConfirmedAt = Date.now();
-          item.deleteReceiptDurable = false;
-          actionReceipts.add(item);
           changed = true;
         }
         continue;
@@ -511,24 +510,9 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
         }
       }
     }
-    if (changed) {
-      touch();
-      if (actionReceipts.size) {
-        // Confirmation is only exposed after the observed event is durably stored.
-        for (const msg of actionReceipts) {
-          if (msg.starObservedAt) msg.starReceiptDurable = true;
-          if (msg.deleteConfirmedAt) msg.deleteReceiptDurable = true;
-        }
-        try { saveNow(true); }
-        catch {
-          // Keep the request reserved; a failed disk write must not confirm it.
-          for (const msg of actionReceipts) {
-            msg.starReceiptDurable = false;
-            msg.deleteReceiptDurable = false;
-          }
-        }
-      }
-    }
+    if (changed) touch();
+    // Confirmacao so vale depois de gravada; se o disco falhar agora, a proxima gravacao boa confirma (M5).
+    if (opsChanged) { try { ops.saveStrict(); } catch (error) { console.error('[crm-ops] failed to save', error?.code || 'write_error'); } }
   };
 
   const upsertPresence = payload => {
@@ -746,6 +730,7 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
     markReadLocal,
     keroSent,
     marcarKeroSentApagada: (jid, id) => { const ok = marcarKeroSentApagada(jid, id); if (ok) touch(); return ok; },
+    ops,
     saveNow
   };
 }

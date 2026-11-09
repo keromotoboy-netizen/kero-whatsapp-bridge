@@ -1,7 +1,9 @@
-// KERO P0 — delete for EVERYONE, one existing own group message per request.
-// Draft only: do not deploy before coordinating the attendant's deletion status contract.
-// The Bridge does not interpret LLM commands and never resends a deletion after uncertainty.
-export function mountCrmGroupDelete(app, secure, { getSocket, isConnected, crm }) {
+// KERO P0 — apagar PARA TODOS uma mensagem propria de grupo (PR30 corrigido 09/11/2026).
+// Rotas PROPRIAS (/crm/group/delete, /crm/group/delete-status): nao sobrepoem a /crm/delete antiga (B0).
+// Usa o indice duravel crm.ops (grupo arquivado / depois da poda). Nunca repete depois de incerteza.
+const DELETE_WINDOW_MS = 60 * 3600 * 1000; // WhatsApp so apaga para todos ate ~60 h (M8)
+
+export function mountCrmGroupDelete(app, secure, { getSocket, isConnected, crm, now = () => Date.now() }) {
   const inFlight = new Set();
   const ref = key => key.jid + '\u0000' + key.id;
   function inspect(req, res) {
@@ -11,74 +13,68 @@ export function mountCrmGroupDelete(app, secure, { getSocket, isConnected, crm }
       res.status(400).json({ ok: false, error: 'invalid_group_message_key' });
       return null;
     }
-    const msg = (crm?.state?.messages?.[jid] || []).find(m => m?.id === id && m?.fromMe === true);
-    if (!msg) {
-      res.status(404).json({ ok: false, error: 'own_message_not_in_local_history', noAction: true });
+    const msg = crm?.ops?.get(jid, id);
+    if (!msg || msg.fromMe !== true) {
+      res.status(404).json({ ok: false, error: 'own_message_not_in_local_index', noAction: true });
       return null;
     }
     return { jid, id, msg };
   }
   function status(key) {
-    // A Baileys sendMessage return is not a server-side revoke event.
-    const confirmed = key.msg.deletedForEveryone === true &&
-      !!key.msg.deleteConfirmedAt && key.msg.deleteReceiptDurable === true;
-    const requested = !!key.msg.deleteRequestedAt;
-    // Locally observed but not durably recorded revocation is an UNKNOWN state.
-    const uncertain = !!key.msg.deleteOutcomeUnknownAt ||
-      (key.msg.deletedForEveryone === true && !confirmed) ||
-      (requested && key.msg.deleted === true && !confirmed);
-    return {
-      ok: true, operation: 'delete', messageRef: { jid: key.jid, id: key.id }, requested,
-      accepted: !!key.msg.deleteCommandAckAt,
-      confirmed, deleted: confirmed,
-      outcome: confirmed ? 'CONFIRMED' : uncertain ? 'UNKNOWN' : inFlight.has(ref(key)) ? 'IN_FLIGHT' : key.msg.deleteCommandAckAt ? 'PENDING' : requested ? 'UNKNOWN' : 'NOT_REQUESTED',
-      confirmationSource: confirmed ? 'messages.update:REVOKE' : null
-    };
+    const m = key.msg;
+    const confirmed = m.deletedForEveryone === true && !!m.deleteConfirmedAt && crm.ops.isDurable(m.deleteConfirmedAt);
+    const observedNotDurable = m.deletedForEveryone === true && !!m.deleteConfirmedAt && !confirmed;
+    const requested = !!m.deleteRequestedAt;
+    const outcome = confirmed ? 'CONFIRMED'
+      : observedNotDurable ? 'UNKNOWN'
+      : m.deleteOutcomeUnknownAt ? 'UNKNOWN'
+      : inFlight.has(ref(key)) ? 'IN_FLIGHT'
+      : m.deleteCommandAckAt ? 'PENDING'
+      : requested ? 'UNKNOWN' : 'NOT_REQUESTED';
+    return { ok: true, operation: 'delete', messageRef: { jid: key.jid, id: key.id }, requested,
+      accepted: !!m.deleteCommandAckAt, confirmed, deleted: confirmed, outcome,
+      confirmationSource: confirmed ? 'messages.update:REVOKE' : null };
   }
-  app.post('/crm/delete-status', secure, async (req, res) => {
+  app.post('/crm/group/delete-status', secure, (req, res) => {
     const key = inspect(req, res);
     if (key) res.json(status(key));
   });
-  app.post('/crm/delete', secure, async (req, res) => {
+  app.post('/crm/group/delete', secure, async (req, res) => {
     const key = inspect(req, res);
     if (!key) return;
-    if (key.msg.deletedForEveryone === true) {
-      const state = status(key);
-      return res.status(state.confirmed ? 200 : 202).json({ ...state, duplicateSuppressed: true });
+    const m = key.msg;
+    if (m.deletedForEveryone === true) {
+      const st = status(key);
+      return res.status(st.confirmed ? 200 : 202).json({ ...st, duplicateSuppressed: true });
     }
-    if (key.msg.deleted === true) {
-      return res.status(409).json({ ok: false, error: 'message_deleted_without_for_everyone_ack', noAction: true });
-    }
-    if (key.msg.deleteRequestedAt) {
-      return res.status(202).json({ ...status(key), duplicateSuppressed: true });
+    if (m.deleteRequestedAt) return res.status(202).json({ ...status(key), duplicateSuppressed: true });
+    const enviadaEm = Number(m.timestamp) > 0 ? Number(m.timestamp) * 1000 : Number(m.createdAt || 0);
+    if (!enviadaEm || now() - enviadaEm > DELETE_WINDOW_MS) {
+      return res.status(409).json({ ok: false, error: 'message_too_old_to_delete_for_everyone', noAction: true });
     }
     const sock = getSocket();
     if (!isConnected() || !sock) return res.status(409).json({ ok: false, error: 'whatsapp_not_connected' });
-    key.msg.deleteRequestedAt = Date.now();
-    try {
-      await crm.saveNow(true);
-    } catch {
-      delete key.msg.deleteRequestedAt;
-      return res.status(503).json({ ok: false, error: 'durable_reservation_failed' });
+    m.deleteRequestedAt = Date.now();
+    try { crm.ops.saveStrict(); }
+    catch {
+      delete m.deleteRequestedAt;
+      return res.status(503).json({ ok: false, error: 'durable_reservation_failed', noAction: true });
     }
     inFlight.add(ref(key));
     try {
-      // Baileys official API: sendMessage(jid, {delete: original.key}).
       const originalKey = { remoteJid: key.jid, id: key.id, fromMe: true };
-      if (key.msg.participant) originalKey.participant = key.msg.participant;
+      if (m.participant) originalKey.participant = m.participant;
       await sock.sendMessage(key.jid, { delete: originalKey });
-      key.msg.deleteCommandAckAt = Date.now();
-      await crm.saveNow(true);
+      m.deleteCommandAckAt = Date.now();
+      try { crm.ops.saveStrict(); } catch {}
       inFlight.delete(ref(key));
-      const state = status(key);
-      return res.status(state.confirmed ? 200 : 202).json(state);
+      const st = status(key);
+      return res.status(st.confirmed ? 200 : 202).json(st);
     } catch {
-      key.msg.deleteOutcomeUnknownAt = Date.now();
-      try { await crm.saveNow(true); } catch {}
+      m.deleteOutcomeUnknownAt = Date.now();
+      try { crm.ops.saveStrict(); } catch {}
       inFlight.delete(ref(key));
       return res.status(502).json({ ...status(key), ok: false, error: 'delete_outcome_unconfirmed' });
-    } finally {
-      inFlight.delete(ref(key));
     }
   });
 }
