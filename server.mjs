@@ -687,6 +687,30 @@ app.post('/crm/delete', secure, async (req, res) => {
 app.get('/crm/kero-sent', secure, (req, res) => {
   res.json({ ok: true, ...CRM.keroSent({ sinceHours: Number(req.query.sinceHours || 58) }) });
 });
+// KERO-ROTAS-20261115-INI (CEO 15/11): rotas que o atendente e a varredura das O.S. chamavam e davam 404 em producao.
+// /crm/group-info: SO LEITURA. Nome, descricao e (com ?participantes=1) os membros do grupo, para o atendente reconhecer motoboy por grupo em comum.
+app.get('/crm/group-info', secure, async (req, res) => {
+  const jid = String(req.query.jid || '');
+  if (!/@g\.us$/.test(jid)) return res.status(400).json({ error: 'group_jid_required' });
+  if (!sock || status !== 'open') return res.status(409).json({ error: 'whatsapp_not_connected' });
+  try {
+    const m = await sock.groupMetadata(jid);
+    const participantes = req.query.participantes ? (m?.participants || []).map(p => ({ id: p.id, lid: p.lid || (String(p.id).endsWith('@lid') ? p.id : null), numero: p.phoneNumber || p.jid || (String(p.id).endsWith('@s.whatsapp.net') ? p.id : null) })) : undefined;
+    res.json({ ok: true, jid, subject: m?.subject || '', desc: m?.desc || '', descId: m?.descId || null, descTime: m?.descTime || null, participantes });
+  } catch (error) {
+    res.status(502).json({ error: 'group_info_failed', message: error?.message || String(error) });
+  }
+});
+// /crm/os-arquivadas: SO LEITURA. O.S. que a Kero postou nos grupos ARQUIVADOS nas ultimas 24 h e que ainda NAO foram apagadas
+// (a varredura das 00h usa para avisar o que sobrou). Vem do mesmo registro do /crm/kero-sent; nunca devolve mensagem de terceiros.
+app.get('/crm/os-arquivadas', secure, (_req, res) => {
+  const ehOS = t => /\bkm\b/i.test(String(t || '')) && /R\$\s*\d|\d+,\d{2}/.test(String(t || ''));
+  const lista = CRM.keroSent({ sinceHours: 24 }).messages || [];
+  const os = lista.filter(m => m.archived && !m.deleted && ehOS(m.text))
+    .map(m => ({ id: m.id, jid: m.jid, timestamp: m.timestamp, text: String(m.text || '').slice(0, 400), deleted: false, grupo: CRM.state.groups?.[m.jid]?.subject || '' }));
+  res.json({ ok: true, os, total: os.length, fonte: 'kero-sent' });
+});
+// KERO-ROTAS-20261115-FIM
 // Favoritar (estrela) uma mensagem: dupla seguranca para a equipe achar e apagar pelos Favoritos.
 app.post('/crm/star', secure, async (req, res) => {
   const jid = String(req.body?.jid || '');
