@@ -40,6 +40,16 @@ const messageText = message => {
   if (m.liveLocationMessage) return '📍 Localização ao vivo';
   if (m.pollCreationMessage || m.pollCreationMessageV2 || m.pollCreationMessageV3) return '📊 Enquete';
   if (m.reactionMessage) return '↪️ Reação';
+  // 15/11/2026 (CEO): clique em botao/enquete vira texto, para a IA do atendimento ler a resposta da Victoria
+  if (m.buttonsResponseMessage) return `🔘 ${m.buttonsResponseMessage.selectedDisplayText || ''} [id:${m.buttonsResponseMessage.selectedButtonId || ''}]`.trim();
+  if (m.templateButtonReplyMessage) return `🔘 ${m.templateButtonReplyMessage.selectedDisplayText || ''} [id:${m.templateButtonReplyMessage.selectedId || ''}]`.trim();
+  if (m.listResponseMessage) return `🔘 ${m.listResponseMessage.title || ''} [id:${m.listResponseMessage.singleSelectReply?.selectedRowId || ''}]`.trim();
+  if (m.interactiveResponseMessage) {
+    let id = '';
+    try { id = JSON.parse(m.interactiveResponseMessage.nativeFlowResponseMessage?.paramsJson || '{}').id || ''; } catch {}
+    return `🔘 ${m.interactiveResponseMessage.body?.text || ''} [id:${id}]`.trim();
+  }
+  if (m.pollUpdateMessage) return '📊 Voto em enquete';
   return '[Mensagem]';
 };
 

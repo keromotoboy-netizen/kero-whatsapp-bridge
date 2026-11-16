@@ -26,7 +26,8 @@ import { createCrmArchivedCleanup } from './archived-cleanup-service.mjs';
 // KERO-CEO-PAUSE-UNTIL-ORDER-20261104-v1: no timer or automatic release.
 export function ceoPauseDecision(action, body = {}) {
   if(action==='react')return {ok:false,error:'ceo_pause_until_further_order',suppressed:'ceo_indefinite_reaction_pause',reacted:false,resumes_at:null,resume_requires:'explicit_ceo_order'};
-  if(action==='send-media' && (/^(image|video)$/i.test(String(body.kind||'')) || /^(image|video)\//i.test(String(body.mimetype||''))))return {ok:false,error:'ceo_pause_until_further_order',pulado:'ceo-indefinite-photo-pause',photoBlocked:true,resumes_at:null,resume_requires:'explicit_ceo_order'};
+  // 15/11/2026 (CEO): a pausa de fotos continua para todos, MENOS imagem para a equipe liberada em KERO_BOTOES_JIDS (recibo em imagem para conferir sem baixar)
+  if(action==='send-media' && (/^(image|video)$/i.test(String(body.kind||'')) || /^(image|video)\//i.test(String(body.mimetype||''))) && !(/^image/i.test(String(body.kind||body.mimetype||'')) && botoesLiberado(String(body.jid||''))))return {ok:false,error:'ceo_pause_until_further_order',pulado:'ceo-indefinite-photo-pause',photoBlocked:true,resumes_at:null,resume_requires:'explicit_ceo_order'};
   return null;
 }
 
@@ -253,6 +254,43 @@ async function sendCrmPix(jid, { chave, tipo = 'CNPJ', nome, valor, referencia, 
   return { ok: true, messageId: msg.key.id };
 }
 
+
+// 15/11/2026 (CEO): BOTOES e ENQUETE para a equipe (fluxo NF/recibo com a Victoria). SO envia para numeros liberados em
+// KERO_BOTOES_JIDS (lista de numeros, so digitos, separados por virgula); vazio = bloqueado. Nunca para cliente.
+function botoesLiberado(targetJid) {
+  const lib = String(process.env.KERO_BOTOES_JIDS || '').split(',').map(x => x.replace(/\D/g, '')).filter(Boolean);
+  const num = String(targetJid || '').replace(/@.*$/, '').replace(/:\d+$/, '').replace(/\D/g, '');
+  return !!num && lib.some(l => num === l || num.endsWith(l) || l.endsWith(num));
+}
+async function sendCrmBotoes(jid, { texto, rodape = '', botoes = [], formato = 'quick' } = {}) {
+  if (!sock || status !== 'open') throw new Error('whatsapp_not_connected');
+  const lista = (Array.isArray(botoes) ? botoes : []).slice(0, 3).map(b => ({ id: String(b.id || '').slice(0, 80), texto: String(b.texto || '').slice(0, 25) })).filter(b => b.id && b.texto);
+  if (!jid || !String(texto || '').trim() || !lista.length) throw new Error('jid_texto_botoes_required');
+  const targetJid = await resolveOutboundJid(String(jid));
+  if (!botoesLiberado(targetJid)) { const e = new Error('botoes_so_para_numeros_liberados'); e.codigo = 423; throw e; }
+  const interactiveMessage = proto.Message.InteractiveMessage.create({
+    body: { text: String(texto).slice(0, 1000) }, footer: { text: String(rodape || '').slice(0, 60) },
+    nativeFlowMessage: { buttons: lista.map(b => ({ name: 'quick_reply', buttonParamsJson: JSON.stringify({ display_text: b.texto, id: b.id }) })) }
+  });
+  const content = { viewOnceMessage: { message: { messageContextInfo: { deviceListMetadata: {}, deviceListMetadataVersion: 2 }, interactiveMessage } } };
+  const msg = generateWAMessageFromContent(targetJid, content, { userJid: sock.user?.id });
+  // formato 'quick' (padrao) = marcacao de mensagem interativa do Business com os botoes; 'cru' = sem a marcacao
+  const extra = formato === 'cru' ? {} : { additionalNodes: [{ tag: 'biz', attrs: {}, content: [{ tag: 'interactive', attrs: { type: 'native_flow', v: '1' }, content: [{ tag: 'native_flow', attrs: { v: '9', name: 'mixed' } }] }] }] };
+  await sock.relayMessage(targetJid, msg.message, { messageId: msg.key.id, ...extra });
+  marcarOrigem(msg);
+  CRM.upsertMessage({ key: msg.key, message: { conversation: `${String(texto).slice(0, 400)}\n[Botoes: ${lista.map(b => b.texto).join(' | ')}]` }, messageTimestamp: Math.floor(Date.now() / 1000) });
+  return { ok: true, messageId: msg.key.id, formato, botoes: lista.length };
+}
+async function sendCrmEnquete(jid, { pergunta, opcoes = [] } = {}) {
+  if (!sock || status !== 'open') throw new Error('whatsapp_not_connected');
+  const vals = (Array.isArray(opcoes) ? opcoes : []).map(o => String(o).slice(0, 100)).filter(Boolean).slice(0, 12);
+  if (!jid || !String(pergunta || '').trim() || vals.length < 2) throw new Error('jid_pergunta_opcoes_required');
+  const targetJid = await resolveOutboundJid(String(jid));
+  if (!botoesLiberado(targetJid)) { const e = new Error('botoes_so_para_numeros_liberados'); e.codigo = 423; throw e; }
+  const sent = await sock.sendMessage(targetJid, { poll: { name: String(pergunta).slice(0, 250), values: vals, selectableCount: 1 } });
+  if (sent) { marcarOrigem(sent); CRM.upsertMessage(sent); }
+  return { ok: true, messageId: sent?.key?.id || null, opcoes: vals.length };
+}
 
 const AI = createAiEngine({
   dataDir: DATA_DIR,
@@ -749,6 +787,15 @@ app.post('/crm/send-pix', secure, async (req, res) => {
     console.error('[crm] send-pix failed', { message: error?.message || String(error) });
     res.status(error?.message === 'whatsapp_not_connected' ? 409 : 502).json({ error: error?.message || 'whatsapp_send_failed' });
   }
+});
+
+app.post('/crm/send-buttons', secure, async (req, res) => {
+  try { res.json(await sendCrmBotoes(String(req.body?.jid || ''), req.body || {})); }
+  catch (error) { console.error('[crm] send-buttons failed', { message: error?.message || String(error) }); res.status(error?.codigo || (error?.message === 'whatsapp_not_connected' ? 409 : 502)).json({ error: error?.message || 'whatsapp_send_failed' }); }
+});
+app.post('/crm/send-poll', secure, async (req, res) => {
+  try { res.json(await sendCrmEnquete(String(req.body?.jid || ''), req.body || {})); }
+  catch (error) { console.error('[crm] send-poll failed', { message: error?.message || String(error) }); res.status(error?.codigo || (error?.message === 'whatsapp_not_connected' ? 409 : 502)).json({ error: error?.message || 'whatsapp_send_failed' }); }
 });
 
 // CEO 26/10/2026: salvar contato na agenda do numero da Kero ("Motoboy Fabricio", "Cliente Joao - Empresa").
