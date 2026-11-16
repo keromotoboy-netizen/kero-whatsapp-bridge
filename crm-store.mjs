@@ -25,6 +25,38 @@ const unwrapMessage = message => {
   return message;
 };
 
+// KERO-CONTATO-VCARD-20261116 (CEO): ler o cartao de contato (vCard) que o cliente manda: nome + telefone.
+const vcardContato = c => {
+  if (!c) return null;
+  const vcard = String(c.vcard || '');
+  const fn = vcard.match(/^FN[^:\r\n]*:(.*)$/mi)?.[1]?.trim() || '';
+  const nome = String(c.displayName || '').trim() || fn;
+  let digitos = vcard.match(/waid=(\d+)/i)?.[1] || '';
+  if (!digitos) {
+    const tel = vcard.match(/^(?:[^:\r\n]*\.)?TEL[^:\r\n]*:(.*)$/mi)?.[1] || '';
+    digitos = tel.replace(/\D/g, '');
+  }
+  const telefone = digitos ? '+' + digitos : '';
+  if (!nome && !telefone) return null;
+  return { nome, telefone };
+};
+
+const contatosDaMensagem = message => {
+  const m = unwrapMessage(message);
+  if (!m) return null;
+  if (m.contactMessage) {
+    const c = vcardContato(m.contactMessage);
+    return c ? [c] : null;
+  }
+  if (m.contactsArrayMessage) {
+    const lista = (m.contactsArrayMessage.contacts || []).map(vcardContato).filter(Boolean);
+    return lista.length ? lista : null;
+  }
+  return null;
+};
+
+const contatoTexto = c => [c.nome, c.telefone].filter(Boolean).join(' ');
+
 const messageText = message => {
   const m = unwrapMessage(message);
   if (!m) return '';
@@ -34,8 +66,11 @@ const messageText = message => {
   if (m.videoMessage) return m.videoMessage.caption || '🎥 Vídeo';  if (m.audioMessage) return '🎵 Áudio';
   if (m.documentMessage) return '📄 ' + (m.documentMessage.fileName || 'Documento');
   if (m.stickerMessage) return '🖼️ Figurinha';
-  if (m.contactMessage) return '👤 Contato';
-  if (m.contactsArrayMessage) return '👥 Contatos';
+  if (m.contactMessage || m.contactsArrayMessage) {
+    const contatos = contatosDaMensagem(m);
+    if (!contatos) return m.contactMessage ? '👤 Contato' : '👥 Contatos';
+    return (m.contactMessage ? '👤 Contato: ' : '👥 Contatos: ') + contatos.map(contatoTexto).join('; ');
+  }
   if (m.locationMessage) return '📍 Localização';
   if (m.liveLocationMessage) return '📍 Localização ao vivo';
   if (m.pollCreationMessage || m.pollCreationMessageV2 || m.pollCreationMessageV3) return '📊 Enquete';
@@ -375,7 +410,8 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
         name: loc.name || null,
         address: loc.address || null,
         caption: loc.caption || loc.comment || null
-      } : null
+      } : null,
+      contatos: contatosDaMensagem(raw.message) // KERO-CONTATO-VCARD-20261116: [{nome, telefone}] do cartao de contato
     };
 
     // KERO-ROBO-VARREDURA-20261105: lembrar a mensagem da Kero em grupo (so id, hora e texto curto), mesmo arquivado.
