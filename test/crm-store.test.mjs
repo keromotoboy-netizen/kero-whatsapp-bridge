@@ -190,3 +190,14 @@ test('KERO-BUSCA-CARTOES-20261109: cartao com sufixo :0 junta no numero base; bu
   const ids = store.getMessages(base, { limit: 50 }).messages.map(m => m.id);
   assert.ok(ids.includes('nova1'), 'mensagem da variante :0 aparece no numero base'); // conversa arquivada nao guarda mensagem local (regra antiga)
 });
+
+// 15/11/2026: clique em botao vira texto legivel (com o id) para a IA do atendimento
+test('clique em botao vira texto com id', () => {
+  const { store } = makeStore();
+  const jid = '5511900000000@s.whatsapp.net';
+  store.upsertMessage(message({ id: 'btn2', jid, ts: 301, text: '', extra: { conversation: undefined, buttonsResponseMessage: { selectedDisplayText: 'Não', selectedButtonId: 'nf_nao' } } }));
+  const ultima = () => store.snapshot().chats.find(c => c.id === jid).lastMessage;
+  assert.equal(ultima(), '🔘 Não [id:nf_nao]');
+  store.upsertMessage(message({ id: 'btn3', jid, ts: 302, text: '', extra: { conversation: undefined, interactiveResponseMessage: { body: { text: 'sim, emitir agora' }, nativeFlowResponseMessage: { paramsJson: JSON.stringify({ id: 'nf_emitir' }) } } } }));
+  assert.equal(ultima(), '🔘 sim, emitir agora [id:nf_emitir]');
+});
