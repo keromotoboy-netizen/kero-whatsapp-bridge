@@ -26,7 +26,8 @@ import { createCrmArchivedCleanup } from './archived-cleanup-service.mjs';
 // KERO-CEO-PAUSE-UNTIL-ORDER-20261104-v1: no timer or automatic release.
 export function ceoPauseDecision(action, body = {}) {
   if(action==='react')return {ok:false,error:'ceo_pause_until_further_order',suppressed:'ceo_indefinite_reaction_pause',reacted:false,resumes_at:null,resume_requires:'explicit_ceo_order'};
-  if(action==='send-media' && (/^(image|video)$/i.test(String(body.kind||'')) || /^(image|video)\//i.test(String(body.mimetype||''))))return {ok:false,error:'ceo_pause_until_further_order',pulado:'ceo-indefinite-photo-pause',photoBlocked:true,resumes_at:null,resume_requires:'explicit_ceo_order'};
+  // 15/11/2026 (CEO): a pausa de fotos continua para todos, MENOS imagem para a equipe liberada em KERO_BOTOES_JIDS (recibo em imagem para conferir sem baixar)
+  if(action==='send-media' && (/^(image|video)$/i.test(String(body.kind||'')) || /^(image|video)\//i.test(String(body.mimetype||''))) && !(/^image/i.test(String(body.kind||body.mimetype||'')) && botoesLiberado(String(body.jid||''))))return {ok:false,error:'ceo_pause_until_further_order',pulado:'ceo-indefinite-photo-pause',photoBlocked:true,resumes_at:null,resume_requires:'explicit_ceo_order'};
   return null;
 }
 
