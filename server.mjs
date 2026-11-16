@@ -264,13 +264,13 @@ function botoesLiberado(targetJid) {
 }
 async function sendCrmBotoes(jid, { texto, rodape = '', botoes = [], formato = 'quick' } = {}) {
   if (!sock || status !== 'open') throw new Error('whatsapp_not_connected');
-  const lista = (Array.isArray(botoes) ? botoes : []).slice(0, 3).map(b => ({ id: String(b.id || '').slice(0, 80), texto: String(b.texto || '').slice(0, 25) })).filter(b => b.id && b.texto);
+  const lista = (Array.isArray(botoes) ? botoes : []).slice(0, 3).map(b => ({ id: String(b.id || '').slice(0, 80), texto: String(b.texto || '').slice(0, 25), copiar: b.copiar ? String(b.copiar).slice(0, 200) : '' })).filter(b => (b.id || b.copiar) && b.texto); // CEO 16/11: botao 'copiar' (cta_copy) = copia o texto (ex.: chave Pix do motoboy) para a area de transferencia
   if (!jid || !String(texto || '').trim() || !lista.length) throw new Error('jid_texto_botoes_required');
   const targetJid = await resolveOutboundJid(String(jid));
   if (!botoesLiberado(targetJid)) { const e = new Error('botoes_so_para_numeros_liberados'); e.codigo = 423; throw e; }
   const interactiveMessage = proto.Message.InteractiveMessage.create({
     body: { text: String(texto).slice(0, 1000) }, footer: { text: String(rodape || '').slice(0, 60) },
-    nativeFlowMessage: { buttons: lista.map(b => ({ name: 'quick_reply', buttonParamsJson: JSON.stringify({ display_text: b.texto, id: b.id }) })) }
+    nativeFlowMessage: { buttons: lista.map(b => b.copiar ? { name: 'cta_copy', buttonParamsJson: JSON.stringify({ display_text: b.texto, id: b.id || 'copiar', copy_code: b.copiar }) } : { name: 'quick_reply', buttonParamsJson: JSON.stringify({ display_text: b.texto, id: b.id }) }) }
   });
   const content = { viewOnceMessage: { message: { messageContextInfo: { deviceListMetadata: {}, deviceListMetadataVersion: 2 }, interactiveMessage } } };
   const msg = generateWAMessageFromContent(targetJid, content, { userJid: sock.user?.id });
