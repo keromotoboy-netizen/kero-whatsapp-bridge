@@ -201,3 +201,72 @@ test('clique em botao vira texto com id', () => {
   store.upsertMessage(message({ id: 'btn3', jid, ts: 302, text: '', extra: { conversation: undefined, interactiveResponseMessage: { body: { text: 'sim, emitir agora' }, nativeFlowResponseMessage: { paramsJson: JSON.stringify({ id: 'nf_emitir' }) } } } }));
   assert.equal(ultima(), '🔘 sim, emitir agora [id:nf_emitir]');
 });
+
+// KERO-CONTATO-VCARD-20261116: cartao de contato (vCard) vira texto legivel + [{nome, telefone}]
+test('contactMessage com waid vira texto com nome e telefone', () => {
+  const { store } = makeStore();
+  const jid = '5511955554444@s.whatsapp.net';
+  store.upsertMessage({
+    key: { id: 'vc-1', remoteJid: jid, fromMe: false },
+    messageTimestamp: 100,
+    message: {
+      contactMessage: {
+        displayName: 'Joao Silva',
+        vcard: 'BEGIN:VCARD\nVERSION:3.0\nN:;Joao Silva;;;\nFN:Joao Silva\nitem1.TEL;waid=5511912345678:+55 11 91234-5678\nitem1.X-ABLabel:Celular\nEND:VCARD'
+      }
+    }
+  });
+  const msg = store.getMessages(jid, { limit: 10 }).messages[0];
+  assert.equal(msg.text, '👤 Contato: Joao Silva +5511912345678');
+  assert.deepEqual(msg.contatos, [{ nome: 'Joao Silva', telefone: '+5511912345678' }]);
+});
+
+test('contactMessage sem waid usa o TEL do vcard e o FN quando falta displayName', () => {
+  const { store } = makeStore();
+  const jid = '5511955554443@s.whatsapp.net';
+  store.upsertMessage({
+    key: { id: 'vc-2', remoteJid: jid, fromMe: false },
+    messageTimestamp: 100,
+    message: {
+      contactMessage: {
+        vcard: 'BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Maria Souza\r\nTEL;type=CELL:+55 (21) 98888-7777\r\nEND:VCARD'
+      }
+    }
+  });
+  const msg = store.getMessages(jid, { limit: 10 }).messages[0];
+  assert.equal(msg.text, '👤 Contato: Maria Souza +5521988887777');
+  assert.deepEqual(msg.contatos, [{ nome: 'Maria Souza', telefone: '+5521988887777' }]);
+});
+
+test('contactsArrayMessage lista todos os contatos separados por "; "', () => {
+  const { store } = makeStore();
+  const jid = '5511955554442@s.whatsapp.net';
+  store.upsertMessage({
+    key: { id: 'vc-3', remoteJid: jid, fromMe: false },
+    messageTimestamp: 100,
+    message: {
+      contactsArrayMessage: {
+        displayName: '2 contatos',
+        contacts: [
+          { displayName: 'Ana', vcard: 'BEGIN:VCARD\nFN:Ana\nTEL;waid=5511900000001:+55 11 90000-0001\nEND:VCARD' },
+          { displayName: 'Beto', vcard: 'BEGIN:VCARD\nFN:Beto\nTEL:+55 31 3333-4444\nEND:VCARD' }
+        ]
+      }
+    }
+  });
+  const msg = store.getMessages(jid, { limit: 10 }).messages[0];
+  assert.equal(msg.text, '👥 Contatos: Ana +5511900000001; Beto +553133334444');
+  assert.deepEqual(msg.contatos, [
+    { nome: 'Ana', telefone: '+5511900000001' },
+    { nome: 'Beto', telefone: '+553133334444' }
+  ]);
+});
+
+test('mensagem comum nao ganha contatos', () => {
+  const { store } = makeStore();
+  const jid = '5511955554441@s.whatsapp.net';
+  store.upsertMessage(message({ id: 'txt-1', jid, ts: 100, text: 'oi' }));
+  const msg = store.getMessages(jid, { limit: 10 }).messages[0];
+  assert.equal(msg.text, 'oi');
+  assert.equal(msg.contatos, null);
+});
