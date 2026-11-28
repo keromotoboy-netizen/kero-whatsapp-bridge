@@ -22,41 +22,19 @@ const unwrapMessage = message => {
   if (message.ephemeralMessage?.message) return unwrapMessage(message.ephemeralMessage.message);
   if (message.viewOnceMessage?.message) return unwrapMessage(message.viewOnceMessage.message);
   if (message.viewOnceMessageV2?.message) return unwrapMessage(message.viewOnceMessageV2.message);
+  // 23/11/2026: comprovante em PDF/imagem com legenda vinha embrulhado e virava [Mensagem] (Termoprol 19/11 13:13)
+  if (message.documentWithCaptionMessage?.message) return unwrapMessage(message.documentWithCaptionMessage.message);
+  if (message.viewOnceMessageV2Extension?.message) return unwrapMessage(message.viewOnceMessageV2Extension.message);
+  if (message.deviceSentMessage?.message) return unwrapMessage(message.deviceSentMessage.message);
   return message;
 };
 
-// KERO-CONTATO-VCARD-20261116 (CEO): ler o cartao de contato (vCard) que o cliente manda: nome + telefone.
-const vcardContato = c => {
-  if (!c) return null;
-  const vcard = String(c.vcard || '');
-  const fn = vcard.match(/^FN[^:\r\n]*:(.*)$/mi)?.[1]?.trim() || '';
-  const nome = String(c.displayName || '').trim() || fn;
-  let digitos = vcard.match(/waid=(\d+)/i)?.[1] || '';
-  if (!digitos) {
-    const tel = vcard.match(/^(?:[^:\r\n]*\.)?TEL[^:\r\n]*:(.*)$/mi)?.[1] || '';
-    digitos = tel.replace(/\D/g, '');
-  }
-  const telefone = digitos ? '+' + digitos : '';
-  if (!nome && !telefone) return null;
-  return { nome, telefone };
+// 23/10/2026: mensagem marcada (responder citando): id + texto da mensagem citada
+const quotedInfo = m => {
+  const ctx = m && Object.values(m).find(v => v && typeof v === 'object' && v.contextInfo?.stanzaId)?.contextInfo;
+  if (!ctx) return null;
+  return { id: ctx.stanzaId, participant: ctx.participant || null, text: ctx.quotedMessage ? messageText(ctx.quotedMessage).slice(0, 600) : '' };
 };
-
-const contatosDaMensagem = message => {
-  const m = unwrapMessage(message);
-  if (!m) return null;
-  if (m.contactMessage) {
-    const c = vcardContato(m.contactMessage);
-    return c ? [c] : null;
-  }
-  if (m.contactsArrayMessage) {
-    const lista = (m.contactsArrayMessage.contacts || []).map(vcardContato).filter(Boolean);
-    return lista.length ? lista : null;
-  }
-  return null;
-};
-
-const contatoTexto = c => [c.nome, c.telefone].filter(Boolean).join(' ');
-
 const messageText = message => {
   const m = unwrapMessage(message);
   if (!m) return '';
@@ -66,32 +44,19 @@ const messageText = message => {
   if (m.videoMessage) return m.videoMessage.caption || '🎥 Vídeo';  if (m.audioMessage) return '🎵 Áudio';
   if (m.documentMessage) return '📄 ' + (m.documentMessage.fileName || 'Documento');
   if (m.stickerMessage) return '🖼️ Figurinha';
-  if (m.contactMessage || m.contactsArrayMessage) {
-    const contatos = contatosDaMensagem(m);
-    if (!contatos) return m.contactMessage ? '👤 Contato' : '👥 Contatos';
-    return (m.contactMessage ? '👤 Contato: ' : '👥 Contatos: ') + contatos.map(contatoTexto).join('; ');
-  }
+  if (m.contactMessage) return '👤 Contato';
+  if (m.contactsArrayMessage) return '👥 Contatos';
   if (m.locationMessage) return '📍 Localização';
   if (m.liveLocationMessage) return '📍 Localização ao vivo';
   if (m.pollCreationMessage || m.pollCreationMessageV2 || m.pollCreationMessageV3) return '📊 Enquete';
   if (m.reactionMessage) return '↪️ Reação';
-  // 15/11/2026 (CEO): clique em botao/enquete vira texto, para a IA do atendimento ler a resposta da Victoria
-  if (m.buttonsResponseMessage) return `🔘 ${m.buttonsResponseMessage.selectedDisplayText || ''} [id:${m.buttonsResponseMessage.selectedButtonId || ''}]`.trim();
-  if (m.templateButtonReplyMessage) return `🔘 ${m.templateButtonReplyMessage.selectedDisplayText || ''} [id:${m.templateButtonReplyMessage.selectedId || ''}]`.trim();
-  if (m.listResponseMessage) return `🔘 ${m.listResponseMessage.title || ''} [id:${m.listResponseMessage.singleSelectReply?.selectedRowId || ''}]`.trim();
-  if (m.interactiveResponseMessage) {
-    let id = '';
-    try { id = JSON.parse(m.interactiveResponseMessage.nativeFlowResponseMessage?.paramsJson || '{}').id || ''; } catch {}
-    return `🔘 ${m.interactiveResponseMessage.body?.text || ''} [id:${id}]`.trim();
-  }
-  if (m.pollUpdateMessage) return '📊 Voto em enquete';
   return '[Mensagem]';
 };
 
 const messageType = message => {
   const m = unwrapMessage(message);
   if (!m) return 'unknown';
-  return Object.keys(m)[0] || 'unknown';
+  return Object.keys(m).find(k => k !== 'messageContextInfo' && k !== 'senderKeyDistributionMessage') || Object.keys(m)[0] || 'unknown';
 };
 
 const thumbnailDataUrl = (bytes, mimetype = 'image/jpeg') => {
@@ -182,7 +147,14 @@ const safeNameFromJid = jid => {
   return jid.split('@')[0]?.replace(/\D/g, '') || jid;
 };
 
-export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, onMedia = null, origemDe = null,
+// Baileys as vezes grava o horario como Long ({low, high}); Number() disso da NaN e embaralha a ordem da lista
+// de conversas (conversa nova ia parar no meio e o atendente, que le so as 25 primeiras, nao via). 23/10/2026
+const tsNum = v => { if (v && typeof v === 'object') v = typeof v.toNumber === 'function' ? v.toNumber() : Number(v.low || 0) + Number(v.high || 0) * 4294967296; const n = Number(v); return Number.isFinite(n) ? n : 0; };
+const chatTs = c => tsNum(c?.lastMessageTimestamp) || tsNum(c?.conversationTimestamp);
+// 23/10/2026: o mapa LID->numero as vezes vem com o aparelho ("5511...:0@s.whatsapp.net") e a mesma conversa virava duas;
+// o atendente lia uma e mandava na outra, e repetia perguntas. Tudo passa a usar o numero sem o ":0".
+const semDevice = j => typeof j === 'string' ? j.replace(/^(\d+):\d+@s\.whatsapp\.net$/, '$1@s.whatsapp.net') : j;
+export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, onMedia = null,
   keepMessagesPerChat = Math.max(0, Number(process.env.CRM_KEEP_MESSAGES_PER_CHAT || 0)) && Math.max(50, Number(process.env.CRM_KEEP_MESSAGES_PER_CHAT)) } = {}) {
   const file = path.join(path.dirname(dataDir), 'crm-state.json');
   let state = {
@@ -198,41 +170,27 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
   } catch (error) {
     console.error('[crm] failed to load state', error?.message || error);
   }
+  // junta as conversas que ja tinham ficado duplicadas com ":0"
+  for (const k of Object.keys(state.chats || {})) {
+    const base = semDevice(k); if (base === k) continue;
+    const a = state.chats[k], b = state.chats[base];
+    state.chats[base] = { ...(a || {}), ...(b || {}), id: base, lastMessageTimestamp: Math.max(chatTs(a), chatTs(b)) || undefined,
+      lastMessage: chatTs(a) > chatTs(b) ? (a?.lastMessage || b?.lastMessage) : (b?.lastMessage || a?.lastMessage) };
+    delete state.chats[k];
+    const ms = [...(state.messages?.[base] || []), ...(state.messages?.[k] || [])];
+    if (ms.length) { const vistos = new Set(); state.messages[base] = ms.filter(m => !vistos.has(m.id) && vistos.add(m.id)).sort((x, y) => tsNum(x.timestamp) - tsNum(y.timestamp)); }
+    delete state.messages?.[k];
+    if (state.chatLabels?.[k]) { state.chatLabels[base] = [...new Set([...(state.chatLabels[base] || []), ...state.chatLabels[k]])]; delete state.chatLabels[k]; }
+  }
+  for (const [k, v] of Object.entries(state.lidMap || {})) { const nk = semDevice(k); if (nk !== k) delete state.lidMap[k]; state.lidMap[nk] = semDevice(v); }
+  for (const k of Object.keys(state.contacts || {})) { const nk = semDevice(k); if (nk !== k) { state.contacts[nk] = { ...state.contacts[k], ...(state.contacts[nk] || {}), id: nk }; delete state.contacts[k]; } }
+  // CEO 31/10: limpa o nome da Kero que ficou gravado como nome de conversa de cliente/motoboy
+  for (const c of Object.values(state.chats || {})) if (c?.pushName && /Kero Motoboy Atendimento/i.test(c.pushName)) delete c.pushName;
   let prunedArchived = 0;
   for (const [jid, chat] of Object.entries(state.chats || {})) {
     if (chat?.archived && state.messages[jid]) { delete state.messages[jid]; prunedArchived++; }
   }
   if (prunedArchived) console.log('[crm] archived chats pruned=' + prunedArchived);
-  // KERO-ROBO-VARREDURA-20261105 (CEO 05/11: "o robo tem que ser capaz de ver as o.s que jogamos manualmente"):
-  // guarda SO as mensagens ENVIADAS PELA KERO (fromMe) em grupos, inclusive arquivados e as mandadas pelo celular,
-  // por ~62 h (o WhatsApp so apaga para todos ate ~60 h). Mensagens de outras pessoas continuam sem ser guardadas (regra 20/10).
-  const KERO_SENT_TTL_S = 62 * 3600, KERO_SENT_MAX_POR_GRUPO = 300, KERO_SENT_TEXTO = 700;
-  if (!state.keroSent || typeof state.keroSent !== 'object' || Array.isArray(state.keroSent)) state.keroSent = {};
-  const podarKeroSent = (agoraS = Math.floor(Date.now() / 1000)) => {
-    for (const [jid, arr] of Object.entries(state.keroSent)) {
-      const vivo = (Array.isArray(arr) ? arr : []).filter(x => x && Number(x.timestamp) >= agoraS - KERO_SENT_TTL_S);
-      if (vivo.length) state.keroSent[jid] = vivo.slice(-KERO_SENT_MAX_POR_GRUPO); else delete state.keroSent[jid];
-    }
-  };
-  podarKeroSent();
-  const marcarKeroSentApagada = (jid, id) => {
-    const x = (state.keroSent[jid] || []).find(m => m.id === id);
-    if (x && !x.deleted) { x.deleted = true; x.deletedAt = Date.now(); return true; }
-    return false;
-  };
-  // Lista para o robo de varredura: so mensagens da Kero, das ultimas N horas (max 62).
-  const keroSent = ({ sinceHours = 58 } = {}) => {
-    const h = Math.min(62, Math.max(1, Number(sinceHours) || 58));
-    const desde = Math.floor(Date.now() / 1000) - h * 3600;
-    podarKeroSent();
-    const messages = [];
-    for (const [jid, arr] of Object.entries(state.keroSent)) {
-      const chat = state.chats[jid];
-      for (const m of arr) if (Number(m.timestamp) >= desde) messages.push({ jid, id: m.id, fromMe: true, timestamp: m.timestamp, text: m.text, deleted: !!m.deleted, archived: !!chat?.archived });
-    }
-    messages.sort((a, b) => a.timestamp - b.timestamp);
-    return { sinceHours: h, total: messages.length, messages };
-  };
   // KERO 20/10/2026 (CRM etapa 6, enxugar Railway): com o espelho D1 ligado, o histórico completo fica no Cloudflare
   // e o bridge guarda só as últimas N por conversa (CRM_KEEP_MESSAGES_PER_CHAT, mínimo 50). Sem espelho, não poda.
   if (mirror && keepMessagesPerChat > 0) {
@@ -264,13 +222,7 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
     saveTimer = setTimeout(saveNow, 250);
   };
 
-  // KERO-BUSCA-CARTOES-20261109: mensagem nova chega com sufixo de aparelho (5511...:0@s.whatsapp.net) e criava um 2o cartao
-  // sem o nome salvo. semAparelho junta tudo no numero base.
-  const semAcento = t => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
-  const semAparelho = jid => String(jid || '').replace(/:\d+@(s\.whatsapp\.net|lid)$/, '@$1');
-  const contactFor = jid0 => {
-    const jid = semAparelho(jid0);
-    if (jid !== jid0 && !state.contacts[jid] && state.contacts[jid0]) return state.contacts[jid0];
+  const contactFor = jid => {
     const mapped = state.lidMap[jid];
     if (String(jid || '').endsWith('@lid') && mapped && String(mapped).endsWith('@s.whatsapp.net')) {
       return state.contacts[mapped] || state.contacts[jid] || {};
@@ -297,21 +249,21 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
     const c = state.chats[jid] || state.chats[state.lidMap[jid]];
     if (!c) return null;
     return { jid, name: chatName(jid), archived: !!c.archived, unread: Number(c.unreadCount || 0),
-      last_ts: Number(c.lastMessageTimestamp || c.conversationTimestamp || 0) || null, last_message: c.lastMessage || null };
+      last_ts: chatTs(c) || null, last_message: c.lastMessage || null };
   });
   const upsertChat = input => {
-    const jid = input?.id;
+    const jid = semDevice(input?.id);
     if (!jid || jid === 'status@broadcast') return;
     const chat = ensureChat(jid);
-    const previousTs = Number(chat.lastMessageTimestamp || chat.conversationTimestamp || 0);
+    const previousTs = chatTs(chat);
     const previousLastMessage = chat.lastMessage || '';
     const next = { ...input };
     delete next.conditional;
     Object.assign(chat, next);
-    const incomingTs = Number(input.lastMessageTimestamp || input.conversationTimestamp || 0);
+    const incomingTs = chatTs(input);
     if (previousTs > 0 && incomingTs > 0 && incomingTs < previousTs) {
       chat.lastMessageTimestamp = previousTs;
-      chat.conversationTimestamp = Math.max(previousTs, Number(chat.conversationTimestamp || 0));
+      chat.conversationTimestamp = Math.max(previousTs, tsNum(chat.conversationTimestamp));
       if (previousLastMessage) chat.lastMessage = previousLastMessage;
     }
     if (typeof input.archived === 'boolean') chat.archived = input.archived;
@@ -323,7 +275,8 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
   };
 
   const upsertContact = input => {
-    const jid = input?.id;
+    if (input?.phoneNumber) input = { ...input, phoneNumber: semDevice(input.phoneNumber) };
+    const jid = semDevice(input?.id);
     if (!jid) return;
     const merged = { ...(state.contacts[jid] || {}), ...input };
     state.contacts[jid] = merged;
@@ -340,6 +293,7 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
 
   const upsertLidMapping = mapping => {
     if (!mapping?.pn || !mapping?.lid) return;
+    mapping = { ...mapping, pn: semDevice(mapping.pn) };
     state.lidMap[mapping.lid] = mapping.pn;
     state.lidMap[mapping.pn] = mapping.lid;
     const pn = state.contacts[mapping.pn];
@@ -350,8 +304,8 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
     const lidChat = state.chats[mapping.lid];
     const pnChat = state.chats[mapping.pn];
     if (lidChat || pnChat) {
-      const lidTs = Number(lidChat?.lastMessageTimestamp || lidChat?.conversationTimestamp || 0);
-      const pnTs = Number(pnChat?.lastMessageTimestamp || pnChat?.conversationTimestamp || 0);
+      const lidTs = chatTs(lidChat);
+      const pnTs = chatTs(pnChat);
       const latest = lidTs > pnTs ? lidChat : pnChat;
       state.chats[mapping.pn] = {
         ...(lidChat || {}),
@@ -381,7 +335,7 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
   };
 
   const upsertMessage = (raw, { countUnread = true } = {}) => {
-    const jid = raw?.key?.remoteJid;
+    const jid = semDevice(raw?.key?.remoteJid);
     if (!jid || jid === 'status@broadcast') return;
     const id = raw?.key?.id;
     if (!id) return;
@@ -392,7 +346,6 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
       id,
       jid,
       fromMe: !!raw.key.fromMe,
-      origem: raw.key.fromMe ? (raw.origem || (typeof origemDe === 'function' && origemDe(id)) || 'humano') : null, // KERO-ORIGEM-20261108: ia | api | humano (so mensagem nossa)
       participant: raw.key.participant || null,
       pushName: raw.pushName || null,
       timestamp: ts,
@@ -400,6 +353,9 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
       type: messageType(raw.message),
       deleted: false,
       media: mediaInfo(raw.message),
+      quoted: quotedInfo(unwrapped), // 23/10: cliente marcou uma mensagem e respondeu a ela
+      // 26/10 (CEO): em qual mensagem foi a reacao (a IA nao encaminha foto que a equipe ja reagiu)
+      reaction: unwrapped?.reactionMessage?.key?.id ? { to: unwrapped.reactionMessage.key.id, emoji: unwrapped.reactionMessage.text || '' } : null,
       location: loc && loc.degreesLatitude != null && loc.degreesLongitude != null ? {
         latitude: Number(loc.degreesLatitude),
         longitude: Number(loc.degreesLongitude),
@@ -410,22 +366,8 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
         name: loc.name || null,
         address: loc.address || null,
         caption: loc.caption || loc.comment || null
-      } : null,
-      contatos: contatosDaMensagem(raw.message) // KERO-CONTATO-VCARD-20261116: [{nome, telefone}] do cartao de contato
+      } : null
     };
-
-    // KERO-ROBO-VARREDURA-20261105: lembrar a mensagem da Kero em grupo (so id, hora e texto curto), mesmo arquivado.
-    if (item.fromMe && String(jid).endsWith('@g.us') && !unwrapped?.protocolMessage && ts >= Math.floor(Date.now() / 1000) - KERO_SENT_TTL_S) {
-      const lista = state.keroSent[jid] ||= [];
-      const atual = lista.find(x => x.id === id);
-      const texto = String(item.text || '').slice(0, KERO_SENT_TEXTO);
-      if (atual) { if (texto) atual.text = texto; }
-      else {
-        lista.push({ id, timestamp: ts, text: texto, deleted: false });
-        lista.sort((a, b) => a.timestamp - b.timestamp);
-        if (lista.length > KERO_SENT_MAX_POR_GRUPO) lista.splice(0, lista.length - KERO_SENT_MAX_POR_GRUPO);
-      }
-    }
 
     let idx = -1;
     if (!chat.archived) {
@@ -440,20 +382,21 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
       if (mirror && keepMessagesPerChat > 0 && arr.length > keepMessagesPerChat) arr.splice(0, arr.length - keepMessagesPerChat);
     }
 
-    const previousLastTs = Number(chat.lastMessageTimestamp || chat.conversationTimestamp || 0);
+    const previousLastTs = chatTs(chat);
     if (ts >= previousLastTs) {
       chat.lastMessageTimestamp = ts;
       chat.lastMessage = item.text;
       // só a chave (sem conteúdo): o WhatsApp precisa dela para aplicar "limpar conversa" no celular
       chat.lastMessageKey = { id, remoteJid: jid, fromMe: !!raw.key.fromMe, ...(raw.key.participant ? { participant: raw.key.participant } : {}) };
     }
-    if (raw.pushName && !chat.pushName) chat.pushName = raw.pushName;
+    if (raw.pushName && !raw.key?.fromMe && !chat.pushName) chat.pushName = raw.pushName; // CEO 31/10: mensagem NOSSA nao da nome a conversa (9 conversas estavam com o nome da Kero)
     if (countUnread && idx < 0 && !item.fromMe) chat.unreadCount = Number(chat.unreadCount || 0) + 1;
     // mídia completa de mensagem nova ao vivo vai ao R2 (chave determinística em media.r2Key)
     if (onMedia && countUnread && item.media && !chat.archived) {
       const key = onMedia(raw, canonicalJid(jid), item.media);
       if (key) item.media.r2Key = key;
     }
+    if (chat.archived && item.fromMe && String(jid).endsWith('@g.us') && /\d\s*KM|🔰/i.test(String(item.text || ''))) guardarOS(item);
     // histórico antigo (replay da sincronização) não vai ao D1; carga inicial é feita em lote separado
     if (mirror && !chat.archived && (countUnread || ts * 1000 >= Date.now() - mirrorHistoryDays * 86400000)) mirror.message({ ...item, jid: canonicalJid(jid) });
     else mirror?.chat(canonicalJid(jid));
@@ -470,10 +413,10 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
   const markDeleted = payload => {
     if (!payload?.keys) return;
     for (const key of payload.keys) {
-      const jid = key?.remoteJid;
+      const jid = semDevice(key?.remoteJid);
       const id = key?.id;
       if (!jid || !id) continue;
-      marcarKeroSentApagada(jid, id);
+      marcarOS(id);
       const arr = state.messages[jid] || [];
       const item = arr.find(x => x.id === id);
       if (item) {
@@ -485,12 +428,21 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
     touch();
   };
 
+  // CEO 30/10: nos arquivados guarda SO as O.S postadas pela Kero (disparo ou a mao), por 24 h, para saber o que sobrou nos grupos.
+  const guardarOS = item => {
+    const l = state.osArquivadas ||= [], lim = Date.now() / 1000 - 86400;
+    state.osArquivadas = l.filter(x => x.timestamp >= lim && x.id !== item.id);
+    state.osArquivadas.push({ id: item.id, jid: item.jid, timestamp: item.timestamp, text: String(item.text).slice(0, 400), deleted: false });
+  };
+  const marcarOS = id => { const x = (state.osArquivadas || []).find(o => o.id === id); if (x) x.deleted = true; };
+  const osArquivadas = () => { const lim = Date.now() / 1000 - 86400; return (state.osArquivadas || []).filter(x => x.timestamp >= lim && !x.deleted); };
+
   const handleMessageUpdates = updates => {
     let changed = false;
     for (const entry of updates || []) {
       const key = entry?.key;
       const update = entry?.update || {};
-      const jid = key?.remoteJid;
+      const jid = semDevice(key?.remoteJid);
       const id = key?.id;
       if (!jid || !id) continue;
       const arr = state.messages[jid] || [];
@@ -507,7 +459,7 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
       }
 
       if (update.message === null && Number(update.messageStubType) === Number(WAMessageStubType.REVOKE)) {
-        if (marcarKeroSentApagada(jid, id)) changed = true;
+        marcarOS(id);
         if (item) {
           item.deleted = true;
           item.deletedAt = Date.now();
@@ -587,7 +539,7 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
   };
 
   const canonicalJid = jid => {
-    const value = semAparelho(jid);
+    const value = String(jid || '');
     if (value.endsWith('@lid')) {
       const mapped = state.lidMap[value];
       if (mapped && String(mapped).endsWith('@s.whatsapp.net')) return String(mapped);
@@ -612,14 +564,14 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
         const canonical = state.chats[id] || members
           .slice()
           .sort((a, b) =>
-            Number(b.lastMessageTimestamp || b.conversationTimestamp || 0) -
-            Number(a.lastMessageTimestamp || a.conversationTimestamp || 0)
+            chatTs(b) -
+            chatTs(a)
           )[0];
         const latest = members
           .slice()
           .sort((a, b) =>
-            Number(b.lastMessageTimestamp || b.conversationTimestamp || 0) -
-            Number(a.lastMessageTimestamp || a.conversationTimestamp || 0)
+            chatTs(b) -
+            chatTs(a)
           )[0] || canonical;
         const aliases = new Set(members.map(x => x.id));
         aliases.add(id);
@@ -630,13 +582,10 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
         return {
           id,
           name: chatName(id),
-          // em duvida, MOSTRA: cartao mais novo nao arquivado (mensagem nova desarquiva no celular) vence o arquivado antigo
-          archived: !!canonical?.archived && !members.some(m => m !== canonical && !m.archived &&
-            Number(m.lastMessageTimestamp || m.conversationTimestamp || 0) > Number(canonical?.lastMessageTimestamp || canonical?.conversationTimestamp || 0)),
-          _busca: semAcento([chatName(id), contact?.name, contact?.notify, contact?.verifiedName, ...members.map(m => m.name || m.pushName), id.replace(/@.*/, '')].filter(Boolean).join(' ')),
+          archived: !!canonical?.archived,
           unreadCount,
           lastMessage: latest?.lastMessage || '',
-          lastMessageTimestamp: Number(latest?.lastMessageTimestamp || latest?.conversationTimestamp || 0),
+          lastMessageTimestamp: chatTs(latest),
           isGroup: id.endsWith('@g.us'),
           labels,
           avatar: contact?.imgUrl && contact.imgUrl !== 'changed' ? contact.imgUrl : null,
@@ -645,8 +594,7 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
       })
       .filter(c => !!c.archived === !!archived)
       .filter(c => !labelId || c.labels.includes(labelId))
-      .filter(c => !q || (c._busca + ' ' + semAcento(c.lastMessage)).includes(semAcento(q)) || (/^\d{4,}$/.test(q.replace(/\D/g, '')) && c.id.replace(/\D/g, '').includes(q.replace(/\D/g, ''))))
-      .map(({ _busca, ...c }) => c)
+      .filter(c => !q || (c.name + ' ' + c.id + ' ' + c.lastMessage).toLowerCase().includes(q))
       .sort((a,b) => b.lastMessageTimestamp - a.lastMessageTimestamp);
   };
 
@@ -666,9 +614,7 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
 
   const getMessages = (jid, options = {}) => {
     const alias = state.lidMap[jid];
-    const base = semAparelho(jid);
-    const variantes = Object.keys(state.messages).filter(k => k !== jid && semAparelho(k) === base);
-    const ids = [...new Set([jid, base, alias, ...variantes].filter(Boolean))];
+    const ids = [...new Set([jid, alias].filter(Boolean))];
     const byId = new Map();
 
     for (const id of ids) {
@@ -757,6 +703,7 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
   };
 
   return {
+    osArquivadas,
     state,
     attach,
     syncGroups,
@@ -770,8 +717,6 @@ export function createCrmStore(dataDir, { mirror = null, mirrorHistoryDays = 7, 
     resolveSendJid,
     getMessages,
     markReadLocal,
-    keroSent,
-    marcarKeroSentApagada: (jid, id) => { const ok = marcarKeroSentApagada(jid, id); if (ok) touch(); return ok; },
     saveNow
   };
 }

@@ -1,17 +1,21 @@
+// CEO 28/10/2026: o libsignal imprimia no log do Railway as sessoes de criptografia (chaves) a cada troca de sessao.
+// Nada de sessao/chave no log: so a linha curta do aviso.
+for (const nivel of ['info', 'warn']) {
+  const orig = console[nivel].bind(console);
+  console[nivel] = (...a) => { const t = String(a[0] ?? ''); if (/^(Closing|Opening|Removing|Migrating)( open| old closed)? ?session/i.test(t)) return; /* KERO 28/11: sem a linha de sessao (era ruido) */ return /session|prekey|Bad MAC/i.test(t) ? orig(t.slice(0, 80)) : orig(...a); };
+}
 import express from 'express';
 import makeWASocket, {
   downloadMediaMessage,
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   DisconnectReason,
-  extractSyncdPatches, decodeSyncdSnapshot, decodePatches, decodeSyncdMutations, proto, BufferJSON, generateWAMessageFromContent
+  extractSyncdPatches, decodeSyncdSnapshot, decodePatches, decodeSyncdMutations, proto,
+  generateWAMessageFromContent, BufferJSON
 } from 'baileys';
 import QRCode from 'qrcode';
 import pino from 'pino';
 import fs from 'node:fs';
-import { createHmac } from 'node:crypto';
-import { DatabaseSync } from 'node:sqlite';
-import { AsyncLocalStorage } from 'node:async_hooks';
 import { createCrmStore } from './crm-store.mjs';
 import { createOutboxWorker, parseAllowedJids } from './outbox-worker.mjs';
 import { createD1Mirror } from './d1-mirror.mjs';
@@ -21,35 +25,23 @@ import { selectAuthDirectory } from './auth-directory.mjs';
 import { maintenanceMutationAllowed, scheduledMaintenanceAllowed } from './maintenance-permissions.mjs';
 import { mountArchivedGroupCleanup } from './archived-group-cleanup.mjs';
 import { createCrmArchivedCleanup } from './archived-cleanup-service.mjs';
+import { readSavedState } from './archive-state-reader.mjs';
 
-
-// KERO-CEO-PAUSE-UNTIL-ORDER-20261104-v1: no timer or automatic release.
-export function ceoPauseDecision(action, body = {}) {
-  if(action==='react')return {ok:false,error:'ceo_pause_until_further_order',suppressed:'ceo_indefinite_reaction_pause',reacted:false,resumes_at:null,resume_requires:'explicit_ceo_order'};
-  // 15/11/2026 (CEO): a pausa de fotos continua para todos, MENOS imagem para a equipe liberada em KERO_BOTOES_JIDS (recibo em imagem para conferir sem baixar)
-  if(action==='send-media' && (/^(image|video)$/i.test(String(body.kind||'')) || /^(image|video)\//i.test(String(body.mimetype||''))) && !(/^image/i.test(String(body.kind||body.mimetype||'')) && botoesLiberado(String(body.jid||''))))return {ok:false,error:'ceo_pause_until_further_order',pulado:'ceo-indefinite-photo-pause',photoBlocked:true,resumes_at:null,resume_requires:'explicit_ceo_order'};
-  return null;
-}
-
+const LID_VISTOS = new Set();
+const LID_PEND = new Set(); let lidTimer = null; // KERO 28/11: lid novo resolvido na hora (antes so ao reconectar)
+const REENVIO_LOG = new Set(); // KERO 28/11: loga cada mensagem apagada so 1 vez
 const app = express();
 app.use(express.json({ limit: '24mb' }));
-// KERO-ORIGEM-20261108 (CEO 08/11, item 18): toda mensagem NOSSA ganha origem. 'ia' = atendente (cabecalho x-kero-origem: ia),
-// 'api' = qualquer outro cliente desta API (painel, scripts), 'humano' = digitada no aparelho (nao passou por aqui).
-// Nunca muda o que e enviado; so etiqueta. ORIGEM_ENVIO guarda id -> origem dos ultimos envios para o store consultar.
-const ORIGEM_REQ = new AsyncLocalStorage(), ORIGEM_ENVIO = new Map();
-app.use((req, res, next) => {
-  const bruto = String(req.get('x-kero-origem') || req.body?.origem || 'api').toLowerCase().replace(/[^a-z-]/g, '').slice(0, 20);
-  ORIGEM_REQ.run(bruto || 'api', next);
-});
-function marcarOrigem(sent) {
-  const id = sent?.key?.id; if (!id) return;
-  ORIGEM_ENVIO.set(String(id), ORIGEM_REQ.getStore() || 'api');
-  while (ORIGEM_ENVIO.size > 5000) ORIGEM_ENVIO.delete(ORIGEM_ENVIO.keys().next().value);
-}
 
 const PORT = Number(process.env.PORT || 3000);
 const API_SECRET = process.env.API_SECRET || '';
 const DATA_DIR = process.env.DATA_DIR || './data/auth';
+// reenvio de mensagem que o outro lado nao conseguiu abrir (getMessage) + contador de tentativas do Baileys
+const ENVIADAS = new Map();
+// CEO 30/10: O.S apagada nao pode voltar: se um aparelho pedir reenvio de uma mensagem ja apagada, a ponte nao reenvia.
+const APAGADAS = new Set();
+const RETRY = new Map();
+const RETRY_CACHE = { get: k => RETRY.get(k), set: (k, v) => { RETRY.set(k, v); if (RETRY.size > 5000) RETRY.delete(RETRY.keys().next().value); return true; }, del: k => RETRY.delete(k), flushAll: () => RETRY.clear() };
 
 if (!API_SECRET) {
   console.error('API_SECRET is required');
@@ -66,7 +58,6 @@ const mediaR2 = process.env.CRM_MEDIA_R2 === '1' && process.env.KERO_QUEUE_URL &
       dailyCap: Number(process.env.CRM_MEDIA_DAILY_CAP || 1500),
       download: raw => downloadMediaMessage(raw, 'buffer', {}, { reuploadRequest: sock?.updateMediaMessage, logger: pino({ level: 'silent' }) }) })
   : null;
-// KERO-PONTE-PARIDADE-31-10-20261105-v1: midia (da ponte de 31/10)
 // KERO 23/10/2026: guarda na memoria as ultimas midias recebidas (so a mensagem, sem o arquivo) para o atendente
 // baixar direto do WhatsApp por GET /crm/media/raw, mesmo com o envio ao R2 desligado. Nada vai para o disco.
 const mediaRaw = new Map();
@@ -82,50 +73,13 @@ const lembrarMidia = (raw, jid, media) => {
   const id = raw?.key?.id; if (id) { mediaRaw.delete(id); mediaRaw.set(id, raw); if (mediaRaw.size > MEDIA_RAW_MAX) mediaRaw.delete(mediaRaw.keys().next().value); guardarMidiaDisco(id, raw); }
   return mediaR2 ? mediaR2.enqueue(raw, jid, media) : null;
 };
-const CRM = createCrmStore(DATA_DIR, { mirror: d1Mirror, onMedia: lembrarMidia, origemDe: id => ORIGEM_ENVIO.get(String(id)) || null });
+const CRM = createCrmStore(DATA_DIR, { mirror: d1Mirror, onMedia: lembrarMidia });
 if (mediaR2) console.log('[media-r2] ligado');
 if (d1Mirror) {
   setInterval(() => { d1Mirror.flush().catch(() => null); }, Number(process.env.CRM_D1_INTERVAL_MS || 5000));
   console.log('[d1-mirror] ligado');
 }
 
-// KERO-MEDIA-IDEMPOTENCY-20261104-V2: permanent per-recipient image history.
-// SQLite is on the pre-existing auth volume; no image bytes or destination JIDs in the database.
-// This never expires entries. Unsafe or uncertain delivery fails closed.
-const IMAGE_SEND_DEDUP_PATH = DATA_DIR + '/kero-image-send-dedup-v2.sqlite';
-const IMAGE_SEND_DEDUP_LEGACY = DATA_DIR + '/kero-image-send-dedup-v1.json';
-let imageSendDedupReady = true;
-let imageSendDedupDb = null;
-let imageDedupSelect, imageDedupInsert, imageDedupConfirm;
-try {
-  imageSendDedupDb = new DatabaseSync(IMAGE_SEND_DEDUP_PATH);
-  imageSendDedupDb.exec('PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
-  imageSendDedupDb.exec("CREATE TABLE IF NOT EXISTS image_history (fingerprint TEXT PRIMARY KEY CHECK(length(fingerprint)=64), state TEXT NOT NULL CHECK(state IN ('pending','sent')), message_id TEXT, first_seen_ms INTEGER NOT NULL) STRICT;");
-  fs.chmodSync(IMAGE_SEND_DEDUP_PATH, 0o600);
-  imageDedupSelect = imageSendDedupDb.prepare('SELECT state, message_id FROM image_history WHERE fingerprint=?');
-  imageDedupInsert = imageSendDedupDb.prepare("INSERT OR IGNORE INTO image_history(fingerprint,state,message_id,first_seen_ms) VALUES (?,'pending',NULL,?)");
-  imageDedupConfirm = imageSendDedupDb.prepare("UPDATE image_history SET state='sent', message_id=? WHERE fingerprint=? AND state='pending'");
-  // Retain ALL V1 entries, including those whose 24h TTL has passed; never prune prior receipts.
-  if (fs.existsSync(IMAGE_SEND_DEDUP_LEGACY)) {
-    const saved = JSON.parse(fs.readFileSync(IMAGE_SEND_DEDUP_LEGACY, 'utf8'));
-    if (!Array.isArray(saved)) throw Error('legacy_dedup_store_shape');
-    imageSendDedupDb.exec('BEGIN IMMEDIATE');
-    try {
-      const migrate = imageSendDedupDb.prepare('INSERT OR IGNORE INTO image_history(fingerprint,state,message_id,first_seen_ms) VALUES (?,?,?,?)');
-      for (const [key, value] of saved) {
-        if (!/^[0-9a-f]{64}$/.test(key) || !value || !['pending','sent'].includes(value.state)) throw Error('legacy_dedup_entry_invalid');
-        migrate.run(key, value.state, value.messageId || null, Number.isSafeInteger(value.expiresAt) ? value.expiresAt - 86400000 : Date.now());
-      }
-      imageSendDedupDb.exec('COMMIT');
-    } catch (error) { imageSendDedupDb.exec('ROLLBACK'); throw error; }
-  }
-} catch (error) {
-  imageSendDedupReady = false;
-  console.error('[media-dedup] permanent store unavailable; image sends disabled', error?.code || error?.message || 'invalid_data');
-}
-function imageSendDedupKey(targetJid, buffer) {
-  return createHmac('sha256', API_SECRET).update(targetJid).update('\0').update(buffer).digest('hex');
-}
 let sock = null;
 let status = 'idle';
 let latestQr = null;
@@ -152,6 +106,60 @@ const archivedGroupCleanup=createCrmArchivedCleanup({
   sdk:{extractSyncdPatches,decodeSyncdSnapshot,decodePatches,decodeSyncdMutations,proto}
 });
 mountArchivedGroupCleanup(app,secure,archivedGroupCleanup);
+
+// CEO 31/10/2026: a ponte nao conseguia ler etiquetas, nomes salvos e arquivadas (faltava a chave do app-state:
+// "failed to find key"). Pede a chave ao celular (mensagem interna do proprio WhatsApp, so para o nosso aparelho) e rele tudo.
+const SDK_APP = { extractSyncdPatches, decodeSyncdSnapshot, decodePatches, decodeSyncdMutations, proto };
+const COLECOES = ['regular', 'regular_high', 'regular_low', 'critical_block', 'critical_unblock_low'];
+let chavesUlt = null;
+async function consertarChaves(extra = []) {
+  if (!sock || status !== 'open') return { erro: 'WHATSAPP_NOT_CONNECTED' };
+  const antes = await readSavedState(sock, SDK_APP).catch(e => ({ errors: { leitura: String(e?.message || e).slice(0, 80) } }));
+  const ids = new Set(extra.map(String));
+  for (const e of Object.values(antes.errors || {})) { const m = String(e).match(/key "([^"]+)"/); if (m) ids.add(m[1]); }
+  let pedido = false;
+  if (ids.size) {
+    const me = String(sock.authState?.creds?.me?.id || '').replace(/:\d+@/, '@');
+    await sock.relayMessage(me, { protocolMessage: { type: proto.Message.ProtocolMessage.Type.APP_STATE_SYNC_KEY_REQUEST,
+      appStateSyncKeyRequest: { keyIds: [...ids].map(id => ({ keyId: Buffer.from(id, 'base64') })) } } },
+      { additionalAttributes: { category: 'peer', push_priority: 'high_force' } });
+    pedido = true;
+    await new Promise(r => setTimeout(r, 20000)); // o celular responde com a chave em segundos
+  }
+  let resync = 'ok';
+  if (ids.size || Object.keys(antes.errors || {}).length) { try { await sock.resyncAppState(COLECOES, false); } catch (e) { resync = String(e?.message || e).slice(0, 120); } }
+  const depois = await readSavedState(sock, SDK_APP).catch(e => ({ errors: { leitura: String(e?.message || e).slice(0, 80) } }));
+  // a leitura completa e a verdade: refaz as etiquetas das conversas quando ela vier sem erro
+  if (!Object.keys(depois.errors || {}).length && Array.isArray(depois.membros)) {
+    const novo = {}; for (const m of depois.membros) { const j = String(m.jid).replace(/:\d+@/, '@'); (novo[j] ||= []).includes(m.labelId) || novo[j].push(m.labelId); }
+    CRM.state.chatLabels = novo;
+    for (const l of depois.listas || []) CRM.state.labels[l.id] = { ...(CRM.state.labels[l.id] || {}), id: l.id, name: l.name, color: l.color, deleted: false };
+    try { CRM.saveNow(); } catch {}
+  }
+  chavesUlt = { at: new Date().toISOString(), pedidas: [...ids], pedido, resync, errosAntes: antes.errors, errosDepois: depois.errors, membros: depois.membros?.length || 0 };
+  console.log('[app-state] conserto', JSON.stringify(chavesUlt).slice(0, 400));
+  return chavesUlt;
+}
+app.post('/crm/app-state/fix-keys', secure, async (req, res) => {
+  try { res.json(await consertarChaves(req.body?.keyIds || [])); } catch (e) { res.status(500).json({ error: 'FIX_KEYS_FAILED', message: String(e?.message || e).slice(0, 160) }); }
+});
+app.get('/crm/app-state/fix-keys', secure, (_req, res) => res.json(chavesUlt || {}));
+// sozinho: 3 min depois de ligar e depois a cada hora, enquanto faltar chave
+setTimeout(() => consertarChaves().catch(() => null), 180e3);
+setInterval(() => { if (!chavesUlt || Object.keys(chavesUlt.errosDepois || {}).length) consertarChaves().catch(() => null); }, 3600e3);
+
+// Somente leitura: respostas rapidas salvas + mensagens favoritas (estrela), com o texto quando a ponte o tem.
+app.get('/crm/app-state/saved', secure, async (_req,res)=>{
+  if(!sock || status!=='open') return res.status(412).json({error:'WHATSAPP_NOT_CONNECTED'});
+  try{
+    const r=await readSavedState(sock,{extractSyncdPatches,decodeSyncdSnapshot,decodePatches,decodeSyncdMutations,proto});
+    const starred=r.starred.map(s=>{
+      const m=(CRM.getMessages(s.jid,{limit:5000}).messages||[]).find(x=>x.id===s.id);
+      return {...s,chat:CRM.state.groups?.[s.jid]?.subject||CRM.state.contacts?.[s.jid]?.name||CRM.state.chats?.[s.jid]?.name||'',text:m?.text||null,messageTimestamp:m?.timestamp||null};
+    });
+    res.json({ok:true,quickReplies:r.quickReplies,starred,errors:r.errors,tipos:r.tipos,listas:r.listas,membros:r.membros});
+  }catch(error){ res.status(500).json({error:'APP_STATE_READ_FAILED',message:String(error?.message||error).slice(0,160)}); }
+});
 
 function publicState() {
   return {
@@ -190,6 +198,8 @@ async function resolveStoredLids() {
   return total;
 }
 
+setInterval(() => resolveStoredLids().then(n => { if (n) console.log('[crm] lid resync=' + n); }).catch(() => {}), 20 * 60 * 1000); // KERO 28/11: antes so no startup
+
 async function resolveOutboundJid(jid) {
   const value = String(jid || '');
   const stored = CRM.resolveSendJid(value);
@@ -201,7 +211,7 @@ async function resolveOutboundJid(jid) {
   return CRM.resolveSendJid(value);
 }
 
-async function sendCrmText(jid, text) {
+async function sendCrmText(jid, text, quotedId) {
   const value = String(jid || '');
   const message = String(text || '').trim();
   if (!value || !message) throw new Error('jid_and_text_required');
@@ -212,12 +222,19 @@ async function sendCrmText(jid, text) {
     throw new Error('contact_number_still_syncing');
   }
 
-  const sent = await sock.sendMessage(targetJid, { text: message });
-  if (sent) { marcarOrigem(sent); CRM.upsertMessage(sent); }
+  // 23/10: responder marcando uma mensagem (quotedId = id da mensagem do cliente)
+  let quoted;
+  if (quotedId) {
+    const q = [value, targetJid].flatMap(j => CRM.getMessages(j, { limit: 300 }).messages || []).find(x => x.id === quotedId);
+    if (q) quoted = { key: { remoteJid: targetJid, id: q.id, fromMe: !!q.fromMe, participant: q.participant || undefined }, message: { conversation: String(q.text || '') } };
+  }
+  const sent = await sock.sendMessage(targetJid, { text: message }, quoted ? { quoted } : undefined);
+  if (sent) CRM.upsertMessage(sent);
   return { ok: true, messageId: sent?.key?.id || null, resolved: targetJid !== value };
 }
 
-// KERO-PONTE-PARIDADE-31-10-20261105-v1: cartao Pix (da ponte de 31/10)
+// CEO 25/10/2026: cartao nativo "Chave Pix" (igual ao do WhatsApp Business: banco, nome, chave e botao "Copiar chave Pix").
+// Valor opcional (em reais). Sem cobranca automatica: o cliente copia a chave e paga no banco dele.
 async function sendCrmPix(jid, { chave, tipo = 'CNPJ', nome, valor, referencia, formato = 'biz' } = {}) {
   if (!sock || status !== 'open') throw new Error('whatsapp_not_connected');
   if (!jid || !chave || !nome) throw new Error('jid_chave_nome_required');
@@ -250,46 +267,8 @@ async function sendCrmPix(jid, { chave, tipo = 'CNPJ', nome, valor, referencia, 
   // formato 'biz' (padrao) = com a marcacao de mensagem interativa do Business; 'cru' = sem ela
   const extra = formato === 'cru' ? {} : { additionalNodes: [{ tag: 'biz', attrs: {}, content: [{ tag: 'interactive', attrs: { type: 'native_flow', v: '1' }, content: [{ tag: 'native_flow', attrs: { v: '9', name: 'payment_info' } }] }] }] };
   await sock.relayMessage(targetJid, msg.message, { messageId: msg.key.id, ...extra });
-  marcarOrigem(msg); CRM.upsertMessage({ key: msg.key, message: { conversation: `[Chave Pix] ${nome} ${tipo}: ${chave}` }, messageTimestamp: Math.floor(Date.now() / 1000) });
+  CRM.upsertMessage({ key: msg.key, message: { conversation: `[Chave Pix] ${nome} ${tipo}: ${chave}` }, messageTimestamp: Math.floor(Date.now() / 1000) });
   return { ok: true, messageId: msg.key.id };
-}
-
-
-// 15/11/2026 (CEO): BOTOES e ENQUETE para a equipe (fluxo NF/recibo com a Victoria). SO envia para numeros liberados em
-// KERO_BOTOES_JIDS (lista de numeros, so digitos, separados por virgula); vazio = bloqueado. Nunca para cliente.
-function botoesLiberado(targetJid) {
-  const lib = String(process.env.KERO_BOTOES_JIDS || '').split(',').map(x => x.replace(/\D/g, '')).filter(Boolean);
-  const num = String(targetJid || '').replace(/@.*$/, '').replace(/:\d+$/, '').replace(/\D/g, '');
-  return !!num && lib.some(l => num === l || num.endsWith(l) || l.endsWith(num));
-}
-async function sendCrmBotoes(jid, { texto, rodape = '', botoes = [], formato = 'quick' } = {}) {
-  if (!sock || status !== 'open') throw new Error('whatsapp_not_connected');
-  const lista = (Array.isArray(botoes) ? botoes : []).slice(0, 3).map(b => ({ id: String(b.id || '').slice(0, 80), texto: String(b.texto || '').slice(0, 25), copiar: b.copiar ? String(b.copiar).slice(0, 200) : '' })).filter(b => (b.id || b.copiar) && b.texto); // CEO 16/11: botao 'copiar' (cta_copy) = copia o texto (ex.: chave Pix do motoboy) para a area de transferencia
-  if (!jid || !String(texto || '').trim() || !lista.length) throw new Error('jid_texto_botoes_required');
-  const targetJid = await resolveOutboundJid(String(jid));
-  if (!botoesLiberado(targetJid)) { const e = new Error('botoes_so_para_numeros_liberados'); e.codigo = 423; throw e; }
-  const interactiveMessage = proto.Message.InteractiveMessage.create({
-    body: { text: String(texto).slice(0, 1000) }, footer: { text: String(rodape || '').slice(0, 60) },
-    nativeFlowMessage: { buttons: lista.map(b => b.copiar ? { name: 'cta_copy', buttonParamsJson: JSON.stringify({ display_text: b.texto, id: b.id || 'copiar', copy_code: b.copiar }) } : { name: 'quick_reply', buttonParamsJson: JSON.stringify({ display_text: b.texto, id: b.id }) }) }
-  });
-  const content = { viewOnceMessage: { message: { messageContextInfo: { deviceListMetadata: {}, deviceListMetadataVersion: 2 }, interactiveMessage } } };
-  const msg = generateWAMessageFromContent(targetJid, content, { userJid: sock.user?.id });
-  // formato 'quick' (padrao) = marcacao de mensagem interativa do Business com os botoes; 'cru' = sem a marcacao
-  const extra = formato === 'cru' ? {} : { additionalNodes: [{ tag: 'biz', attrs: {}, content: [{ tag: 'interactive', attrs: { type: 'native_flow', v: '1' }, content: [{ tag: 'native_flow', attrs: { v: '9', name: 'mixed' } }] }] }] };
-  await sock.relayMessage(targetJid, msg.message, { messageId: msg.key.id, ...extra });
-  marcarOrigem(msg);
-  CRM.upsertMessage({ key: msg.key, message: { conversation: `${String(texto).slice(0, 400)}\n[Botoes: ${lista.map(b => b.texto).join(' | ')}]` }, messageTimestamp: Math.floor(Date.now() / 1000) });
-  return { ok: true, messageId: msg.key.id, formato, botoes: lista.length };
-}
-async function sendCrmEnquete(jid, { pergunta, opcoes = [] } = {}) {
-  if (!sock || status !== 'open') throw new Error('whatsapp_not_connected');
-  const vals = (Array.isArray(opcoes) ? opcoes : []).map(o => String(o).slice(0, 100)).filter(Boolean).slice(0, 12);
-  if (!jid || !String(pergunta || '').trim() || vals.length < 2) throw new Error('jid_pergunta_opcoes_required');
-  const targetJid = await resolveOutboundJid(String(jid));
-  if (!botoesLiberado(targetJid)) { const e = new Error('botoes_so_para_numeros_liberados'); e.codigo = 423; throw e; }
-  const sent = await sock.sendMessage(targetJid, { poll: { name: String(pergunta).slice(0, 250), values: vals, selectableCount: 1 } });
-  if (sent) { marcarOrigem(sent); CRM.upsertMessage(sent); }
-  return { ok: true, messageId: sent?.key?.id || null, opcoes: vals.length };
 }
 
 const AI = createAiEngine({
@@ -346,19 +325,63 @@ async function startSession(mode, phone = null) {
       auth: state,
       version,
       logger: pino({ level: 'warn' }),
-      browser: ['Windows', 'Chrome', '10.0'], // CEO 09/11: aparelho conectado com nome comum, nunca robo/IA/CRM
+      // CEO 25/10/2026: nunca se identificar como CRM/IA/robo: aparece como um Chrome no Windows comum
+      // (tambem e o formato que o WhatsApp aceita para conectar por codigo de numero)
+      browser: ['Windows', 'Chrome', '10.0.22631'],
       markOnlineOnConnect: false,
       syncFullHistory: true,
-      shouldSyncHistoryMessage: () => true
+      shouldSyncHistoryMessage: () => true,
+      // CEO 28/10: "Bad MAC"/mensagem que nao abriu -> o WhatsApp pede para reenviar; sem isto a ponte nao conseguia
+      // reenviar e o cliente ficava com "Aguardando mensagem". Guarda as mensagens enviadas e conta as tentativas.
+      msgRetryCounterCache: RETRY_CACHE,
+      getMessage: async key => APAGADAS.has(key?.id) ? (REENVIO_LOG.has(key?.id) ? 0 : (REENVIO_LOG.add(key?.id), console.log('[crm] reenvio negado: mensagem apagada', key?.id)), undefined) : ENVIADAS.get(key?.id) || mediaRaw.get(key?.id)?.message || undefined
+    });
+    sock.ev.on('messages.upsert', ({ messages }) => {
+      for (const m of messages || []) if (m.key?.fromMe && m.key.id && m.message) {
+        ENVIADAS.set(m.key.id, m.message);
+        if (ENVIADAS.size > 3000) ENVIADAS.delete(ENVIADAS.keys().next().value);
+      }
     });
 
     CRM.attach(sock);
+    // KERO 28/11 (CEO): resposta de cliente chega por chat oculto (@lid) e a ponte nao ligava ao numero. O Baileys 7 traz o numero nas chaves
+    // (remoteJidAlt / participantAlt) quando sabe; guarda esse mapa para o /crm/messages?jid=<numero> trazer as respostas.
+    sock.ev.on('messages.upsert', ({ messages }) => {
+      for (const m of messages || []) {
+        try {
+          const k = m.key || {};
+          for (const [id, alt] of [[k.remoteJid, k.remoteJidAlt], [k.participant, k.participantAlt]]) {
+            if (String(id || '').endsWith('@lid') && String(alt || '').endsWith('@s.whatsapp.net')) { CRM.upsertLidMapping({ lid: id, pn: alt }); LID_VISTOS.add(id); }
+            else if (String(id || '').endsWith('@lid') && !CRM.state?.lidMap?.[id]) {
+              LID_PEND.add(id); clearTimeout(lidTimer);
+              lidTimer = setTimeout(async () => { const l = [...LID_PEND]; LID_PEND.clear(); try { for (const mp of (await sock?.signalRepository?.lidMapping?.getPNsForLIDs?.(l)) || []) CRM.upsertLidMapping(mp); } catch { /* tenta no proximo ciclo */ } }, 2500);
+            }
+          }
+        } catch { /* nao derruba a ponte */ }
+      }
+    });
     sock.ev.on('messages.upsert', ({ messages, type }) => {
+      // CEO 26/10: guarda a estrutura completa dos cartoes "Chave Pix" que o celular manda (resposta rapida do Business)
+      // para a IA copiar o formato exato. So mensagens interativas enviadas pela Kero; nada de cliente.
+      for (const m of messages || []) {
+        const c = m.message || {};
+        const inner = c.viewOnceMessage?.message || c.viewOnceMessageV2?.message || c.ephemeralMessage?.message || c;
+        if (m.key?.fromMe && (inner.interactiveMessage || inner.buttonsMessage || inner.templateMessage)) {
+          try { fs.appendFileSync(DATA_DIR + '/cartoes-pix.jsonl', JSON.stringify({ em: new Date().toISOString(), type, key: m.key, message: c }) + '\n'); } catch {}
+        }
+      }
       if (type !== 'notify') return;
       for (const message of messages || []) {
         AI.handleIncoming(message).catch(error => {
           console.error('[ai] incoming handler failed', error?.message || error);
         });
+        verificarPrimeiroContato(message).catch(() => {});
+      }
+    });
+    // chats.update traz o timer da conversa (o mesmo do perfil da pessoa > Mensagens temporarias)
+    sock.ev.on('chats.update', chats => {
+      for (const c of chats || []) {
+        if (c?.id && c.ephemeralExpiration !== undefined) TEMPORARIAS.timer.set(c.id, Number(c.ephemeralExpiration) || 0);
       }
     });
     sock.ev.on('creds.update', saveCreds);
@@ -394,6 +417,7 @@ async function startSession(mode, phone = null) {
         pairingCode = null;
         lastError = null;
         console.log('[wa] connected successfully');
+        if (typeof sock.updateDefaultDisappearingMode === 'function') sock.updateDefaultDisappearingMode(0).then(() => console.log('[temporarias] timer padrao da conta = desligado')).catch(e => console.error('[temporarias] timer padrao falhou', e?.message || e));
         CRM.syncGroups(sock).then(n => console.log('[crm] groups synced=' + n)).catch(e => console.error('[crm] group sync failed', e?.message || e));
         setTimeout(() => resolveStoredLids().then(n => console.log('[crm] lid mappings resolved=' + n)).catch(e => console.error('[crm] lid resolve failed', e?.message || e)), 1200);
       }
@@ -531,6 +555,19 @@ app.get('/crm/snapshot', secure, (req, res) => {
   res.json(CRM.snapshot({ archived, search, labelId, limit, offset, includeMeta }));
 });
 
+app.get('/crm/media/raw', secure, async (req, res) => {
+  const raw = mediaRaw.get(String(req.query.id || '')) || lerMidiaDisco(String(req.query.id || ''));
+  if (!raw) return res.status(404).json({ ok: false, error: 'midia nao esta na memoria da ponte' });
+  try {
+    const m = raw.message || {};
+    const inner = m.ephemeralMessage?.message || m.viewOnceMessage?.message || m.viewOnceMessageV2?.message || m.documentWithCaptionMessage?.message || m;
+    const tipo = Object.keys(inner).find(k => /(image|video|audio|document|sticker)Message$/.test(k));
+    const buf = await downloadMediaMessage(raw, 'buffer', {}, { reuploadRequest: sock?.updateMediaMessage, logger: pino({ level: 'silent' }) });
+    res.set('Content-Type', inner[tipo]?.mimetype || 'application/octet-stream');
+    res.send(buf);
+  } catch (e) { res.status(502).json({ ok: false, error: String(e?.message || e).slice(0, 160) }); }
+});
+
 app.get('/crm/messages', secure, (req, res) => {
   const jid = String(req.query.jid || '');
   if (!jid) return res.status(400).json({ error: 'missing_jid' });
@@ -538,6 +575,25 @@ app.get('/crm/messages', secure, (req, res) => {
   const before = Math.max(0, Number(req.query.before || 0));
   const offset = Math.max(0, Number(req.query.offset || 0));
   res.json({ jid, ...CRM.getMessages(jid, { limit, before, offset }) });
+});
+
+// KERO 28/11 (CEO): respostas NOVAS de todos os chats numa chamada so, com o chat oculto (@lid) ja ligado ao numero (pn). Para os robos (ex.: Dunelli).
+app.get('/crm/inbox', secure, (req, res) => {
+  const since = Math.max(0, Number(req.query.since || 0));
+  const limit = Math.min(1000, Math.max(1, Number(req.query.limit || 300)));
+  const lm = CRM.state?.lidMap || {}, vistos = new Set(), out = [];
+  for (const [jid, arr] of Object.entries(CRM.state?.messages || {})) {
+    if (jid.endsWith('@g.us') || jid === 'status@broadcast') continue;
+    const pnRaw = jid.endsWith('@lid') ? lm[jid] : jid, pn = pnRaw && String(pnRaw).endsWith('@s.whatsapp.net') ? pnRaw : null;
+    for (const m of arr || []) {
+      if (!m || m.fromMe) continue;
+      const ts = typeof m.timestamp === 'object' && m.timestamp ? Number(m.timestamp.low || 0) + Number(m.timestamp.high || 0) * 4294967296 : Number(m.timestamp) || 0;
+      if (ts < since || vistos.has(m.id)) continue; vistos.add(m.id);
+      out.push({ jid, pn, nome: CRM.state.chats?.[jid]?.name || m.pushName || null, id: m.id, timestamp: ts, type: m.type || null, text: m.text || null });
+    }
+  }
+  out.sort((a, b) => a.timestamp - b.timestamp);
+  res.json({ since, total: out.length, messages: out.slice(-limit) });
 });
 
 app.get('/crm/avatar', secure, async (req, res) => {
@@ -559,7 +615,7 @@ app.post('/crm/send', secure, async (req, res) => {
   if (!jid || !text) return res.status(400).json({ error: 'jid_and_text_required' });
 
   try {
-    res.json(await sendCrmText(jid, text));
+    res.json(await sendCrmText(jid, text, req.body?.quotedId ? String(req.body.quotedId) : undefined));
   } catch (error) {
     const code = error?.message === 'whatsapp_not_connected' || error?.message === 'contact_number_still_syncing'
       ? 409
@@ -574,9 +630,16 @@ app.post('/crm/send', secure, async (req, res) => {
   }
 });
 
+app.post('/crm/send-pix', secure, async (req, res) => {
+  try {
+    res.json(await sendCrmPix(String(req.body?.jid || ''), req.body || {}));
+  } catch (error) {
+    console.error('[crm] send-pix failed', { message: error?.message || String(error) });
+    res.status(error?.message === 'whatsapp_not_connected' ? 409 : 502).json({ error: error?.message || 'whatsapp_send_failed' });
+  }
+});
+
 app.post('/crm/send-media', secure, async (req, res) => {
-  const ceoPause = ceoPauseDecision('send-media', req.body);
-  if (ceoPause) return res.status(423).json(ceoPause);
   const jid = String(req.body?.jid || '');
   const kind = String(req.body?.kind || '');
   const dataBase64 = String(req.body?.dataBase64 || '');
@@ -605,38 +668,8 @@ app.post('/crm/send-media', secure, async (req, res) => {
     if (jid.endsWith('@lid') && targetJid === jid) {
       return res.status(409).json({ error: 'contact_number_still_syncing' });
     }
-    let dedupKey = null;
-    if (kind === 'image') {
-      if (!imageSendDedupReady) return res.status(503).json({ error: 'image_dedup_unavailable' });
-      dedupKey = imageSendDedupKey(targetJid, buffer);
-      try {
-        const reservation = imageDedupInsert.run(dedupKey, Date.now());
-        if (reservation.changes === 0) {
-          const prev = imageDedupSelect.get(dedupKey);
-          if (!prev || prev.state === 'pending')
-            return res.status(409).json({ error: 'image_delivery_uncertain', duplicate: true });
-          return res.json({ ok: true, duplicate: true, suppressed: 'image_already_sent',
-            messageId: prev.message_id || null, resolved: targetJid !== jid });
-        }
-      } catch (error) {
-        imageSendDedupReady = false;
-        console.error('[media-dedup] permanent reservation failed', error?.code || 'storage_error');
-        return res.status(503).json({ error: 'image_dedup_unavailable' });
-      }
-    }
     const sent = await sock.sendMessage(targetJid, content);
-    if (dedupKey) {
-      if (!sent?.key?.id) throw Error('media_delivery_uncertain');
-      try {
-        const receipt = imageDedupConfirm.run(sent.key.id, dedupKey);
-        if (receipt.changes !== 1) throw Error('receipt_update_missing');
-      } catch (error) {
-        imageSendDedupReady = false;
-        console.error('[media-dedup] post-send receipt failed; next images blocked',
-          error?.code || 'storage_error');
-      }
-    }
-    if (sent) { marcarOrigem(sent); CRM.upsertMessage(sent); }
+    if (sent) CRM.upsertMessage(sent);
     res.json({ ok: true, messageId: sent?.key?.id || null, resolved: targetJid !== jid });
   } catch (error) {
     console.error('[crm] media send failed', {
@@ -656,6 +689,40 @@ app.post('/crm/read', secure, (req, res) => {
   if (!jid) return res.status(400).json({ error: 'missing_jid' });
   CRM.markReadLocal(jid);
   res.json({ ok: true });
+});
+
+// CEO 25/10/2026: marcar como LIDA de verdade (tique azul no WhatsApp da pessoa) as mensagens recebidas ainda nao lidas
+// da conversa, antes de responder, como uma pessoa faz. Antes so marcava no CRM local.
+app.post('/crm/seen', secure, async (req, res) => {
+  const jid = String(req.body?.jid || '');
+  if (!jid) return res.status(400).json({ error: 'missing_jid' });
+  if (!sock || status !== 'open') return res.status(409).json({ error: 'whatsapp_not_connected' });
+  try {
+    const msgs = CRM.getMessages(jid, { limit: 15 }).messages || [];
+    const ultimaNossa = Math.max(0, ...msgs.filter(m => m.fromMe).map(m => Number(m.timestamp) || 0));
+    const keys = msgs.filter(m => !m.fromMe && m.id && (Number(m.timestamp) || 0) >= ultimaNossa)
+      .map(m => ({ remoteJid: m.remoteJid || m.chatJid || m.jid || jid, id: m.id, fromMe: false, ...(m.participant ? { participant: m.participant } : {}) }));
+    if (keys.length) await sock.readMessages(keys);
+    CRM.markReadLocal(jid);
+    res.json({ ok: true, lidas: keys.length });
+  } catch (error) {
+    res.status(502).json({ error: 'seen_failed', message: error?.message || String(error) });
+  }
+});
+
+// CEO 25/10/2026: le a DESCRICAO do grupo (regras de valor dos grupos de motoboys mudam; a IA confere antes de disparar)
+app.get('/crm/group-info', secure, async (req, res) => {
+  const jid = String(req.query.jid || '');
+  if (!/@g\.us$/.test(jid)) return res.status(400).json({ error: 'group_jid_required' });
+  if (!sock || status !== 'open') return res.status(409).json({ error: 'whatsapp_not_connected' });
+  try {
+    const m = await sock.groupMetadata(jid);
+    // 26/10: participantes (LID + numero) com ?participantes=1 -> o atendente reconhece motoboy/motorista por grupo em comum
+    const participantes = req.query.participantes ? (m?.participants || []).map(p => ({ id: p.id, lid: p.lid || (String(p.id).endsWith('@lid') ? p.id : null), numero: p.phoneNumber || p.jid || (String(p.id).endsWith('@s.whatsapp.net') ? p.id : null) })) : undefined;
+    res.json({ ok: true, jid, subject: m?.subject || '', desc: m?.desc || '', descId: m?.descId || null, descTime: m?.descTime || null, participantes });
+  } catch (error) {
+    res.status(502).json({ error: 'group_info_failed', message: error?.message || String(error) });
+  }
 });
 
 app.post('/crm/presence', secure, async (req, res) => {
@@ -686,8 +753,6 @@ app.post('/crm/typing', secure, async (req, res) => {
 
 // KERO 22/10/2026: reacao com emoji na mensagem do cliente (a equipe ve que a IA leu). emoji vazio remove a reacao.
 app.post('/crm/react', secure, async (req, res) => {
-  const ceoPause = ceoPauseDecision('react', req.body);
-  if (ceoPause) return res.status(423).json(ceoPause);
   const jid = String(req.body?.jid || '');
   const id = String(req.body?.id || '');
   const emoji = String(req.body?.emoji ?? '❤️').slice(0, 8);
@@ -703,8 +768,63 @@ app.post('/crm/react', secure, async (req, res) => {
   }
 });
 
-// KERO-PONTE-APAGAR-FAVORITAR-20261105-v1: CEO 05/11/2026 "nao dispare nunca nenhum sem favoritar". Rotas da ponte de 31/10, sem mudanca de comportamento.
-// Apagar PARA TODOS uma mensagem enviada pela Kero. Resposta 200 = o WhatsApp aceitou o pedido de apagar.
+// CEO 24/10/2026: conversa com mensagens temporarias -> desliga sozinho e confere nos dois lugares
+// (aviso na area de mensagens e timer do perfil da pessoa, que no WhatsApp e o mesmo ajuste da conversa).
+// So UMA verificacao por conversa: no primeiro contato (nos chamamos ou a pessoa chama), a partir de 24/10/2026 ~19h40.
+// Conversas anteriores ficam de fora (a equipe ja tratou). Lista das ja verificadas fica em disco.
+const TEMPORARIAS_INICIO = 1792881600; // 2026-10-24T22:40:00Z
+const TEMPORARIAS_ARQ = DATA_DIR.replace(/[\\/]+$/, '') + '-temporarias-verificadas.json';
+const TEMPORARIAS = { timer: new Map(), ultimo: new Map(), log: [], vistas: new Set() };
+try { for (const j of JSON.parse(fs.readFileSync(TEMPORARIAS_ARQ, 'utf8'))) TEMPORARIAS.vistas.add(j); } catch {}
+const gravarVistas = () => { try { fs.writeFileSync(TEMPORARIAS_ARQ, JSON.stringify([...TEMPORARIAS.vistas])); } catch {} };
+async function verificarPrimeiroContato(message) {
+  const jid = message?.key?.remoteJid || '';
+  if (!jid || /@(broadcast|newsletter)$|@g\.us$/.test(jid) || TEMPORARIAS.vistas.has(jid)) return;
+  if (Number(message?.messageTimestamp || 0) < TEMPORARIAS_INICIO) return;
+  const m = message?.message;
+  if (!m || m.protocolMessage?.type === 0 || m.reactionMessage) return;
+  // mensagem nossa nao mostra o timer; espera a primeira da pessoa, a nao ser que o timer ja seja conhecido
+  const timer = TEMPORARIAS.timer.get(jid);
+  if (message.key.fromMe && !temporariaAtiva(m) && !(timer > 0)) return;
+  TEMPORARIAS.vistas.add(jid); gravarVistas();
+  if (temporariaAtiva(m) || timer > 0) await desligarTemporarias(jid, message.key.fromMe ? 'primeiro_contato_nosso' : 'primeiro_contato_cliente');
+}
+function temporariaAtiva(m) {
+  if (!m) return false;
+  if (m.ephemeralMessage) return true;
+  const p = m.protocolMessage;
+  if (p && (p.type === 3 || p.type === 'EPHEMERAL_SETTING')) return Number(p.ephemeralExpiration) > 0;
+  const inner = m.viewOnceMessage?.message || m.viewOnceMessageV2?.message || m.documentWithCaptionMessage?.message || m;
+  return Object.values(inner).some(v => v && typeof v === 'object' && Number(v.contextInfo?.expiration) > 0);
+}
+async function desligarTemporarias(jid, origem) {
+  if (!sock || status !== 'open' || /@(broadcast|newsletter)$/.test(jid)) return { ok: false, motivo: 'indisponivel' };
+  const agora = Date.now();
+  TEMPORARIAS.ultimo.set(jid, agora);
+  const item = { at: new Date(agora).toISOString(), jid, origem, ok: false };
+  try {
+    await sock.sendMessage(await resolveOutboundJid(jid), { disappearingMessagesInChat: false });
+    item.ok = true;
+  } catch (error) {
+    item.erro = error?.message || String(error);
+  }
+  TEMPORARIAS.log.push(item);
+  if (TEMPORARIAS.log.length > 200) TEMPORARIAS.log.shift();
+  console.log('[temporarias] ' + (item.ok ? 'desligadas' : 'falhou') + ' origem=' + origem);
+  return item;
+}
+app.post('/crm/ephemeral', secure, async (req, res) => {
+  const jid = String(req.body?.jid || '');
+  if (!jid) return res.status(400).json({ error: 'jid_required' });
+  if (!sock || status !== 'open') return res.status(409).json({ error: 'whatsapp_not_connected' });
+  TEMPORARIAS.ultimo.delete(jid);
+  res.json(await desligarTemporarias(jid, 'manual'));
+});
+app.get('/crm/ephemeral', secure, (_req, res) => {
+  res.json({ ativas: [...TEMPORARIAS.timer].filter(([, t]) => t > 0).map(([jid, t]) => ({ jid, segundos: t })), log: TEMPORARIAS.log.slice(-50) });
+});
+
+// CEO 24/10/2026: ao recalcular, a IA apaga para todos o orcamento anterior (so mensagem enviada por nos).
 app.post('/crm/delete', secure, async (req, res) => {
   const jid = String(req.body?.jid || '');
   const id = String(req.body?.id || '');
@@ -712,90 +832,28 @@ app.post('/crm/delete', secure, async (req, res) => {
   if (!sock || status !== 'open') return res.status(409).json({ error: 'whatsapp_not_connected' });
   try {
     const targetJid = await resolveOutboundJid(jid);
-    const sent = await sock.sendMessage(targetJid, { delete: { remoteJid: targetJid, id, fromMe: true } });
-    CRM.marcarKeroSentApagada(targetJid, id);
-    res.json({ ok: true, deleted: id, revokeId: sent?.key?.id || null });
+    APAGADAS.add(id); ENVIADAS.delete(id);
+    await sock.sendMessage(targetJid, { delete: { remoteJid: targetJid, id, fromMe: true } });
+    res.json({ ok: true });
   } catch (error) {
     res.status(502).json({ error: 'delete_failed', message: error?.message || String(error) });
   }
 });
 
-// KERO-ROBO-VARREDURA-20261105: SO LEITURA. Mensagens enviadas pela Kero em grupos (inclusive arquivados e do celular),
-// ultimas N horas (max 62). Usada pelo robo independente de varredura de O.S. Nao guarda nem devolve mensagem de terceiros.
-app.get('/crm/kero-sent', secure, (req, res) => {
-  res.json({ ok: true, ...CRM.keroSent({ sinceHours: Number(req.query.sinceHours || 58) }) });
-});
-// KERO-ROTAS-20261115-INI (CEO 15/11): rotas que o atendente e a varredura das O.S. chamavam e davam 404 em producao.
-// /crm/group-info: SO LEITURA. Nome, descricao e (com ?participantes=1) os membros do grupo, para o atendente reconhecer motoboy por grupo em comum.
-app.get('/crm/group-info', secure, async (req, res) => {
-  const jid = String(req.query.jid || '');
-  if (!/@g\.us$/.test(jid)) return res.status(400).json({ error: 'group_jid_required' });
-  if (!sock || status !== 'open') return res.status(409).json({ error: 'whatsapp_not_connected' });
-  try {
-    const m = await sock.groupMetadata(jid);
-    const participantes = req.query.participantes ? (m?.participants || []).map(p => ({ id: p.id, lid: p.lid || (String(p.id).endsWith('@lid') ? p.id : null), numero: p.phoneNumber || p.jid || (String(p.id).endsWith('@s.whatsapp.net') ? p.id : null) })) : undefined;
-    res.json({ ok: true, jid, subject: m?.subject || '', desc: m?.desc || '', descId: m?.descId || null, descTime: m?.descTime || null, participantes });
-  } catch (error) {
-    res.status(502).json({ error: 'group_info_failed', message: error?.message || String(error) });
-  }
-});
-// /crm/os-arquivadas: SO LEITURA. O.S. que a Kero postou nos grupos ARQUIVADOS nas ultimas 24 h e que ainda NAO foram apagadas
-// (a varredura das 00h usa para avisar o que sobrou). Vem do mesmo registro do /crm/kero-sent; nunca devolve mensagem de terceiros.
-app.get('/crm/os-arquivadas', secure, (_req, res) => {
-  const ehOS = t => /\bkm\b/i.test(String(t || '')) && /R\$\s*\d|\d+,\d{2}/.test(String(t || ''));
-  const lista = CRM.keroSent({ sinceHours: 24 }).messages || [];
-  const os = lista.filter(m => m.archived && !m.deleted && ehOS(m.text))
-    .map(m => ({ id: m.id, jid: m.jid, timestamp: m.timestamp, text: String(m.text || '').slice(0, 400), deleted: false, grupo: CRM.state.groups?.[m.jid]?.subject || '' }));
-  res.json({ ok: true, os, total: os.length, fonte: 'kero-sent' });
-});
-// KERO-ROTAS-20261115-FIM
-// Favoritar (estrela) uma mensagem: dupla seguranca para a equipe achar e apagar pelos Favoritos.
+// CEO 27/10/2026: favoritar a O.S jogada nos grupos (a alocacao chamava /crm/star, que nao existia -> nada era favoritado)
 app.post('/crm/star', secure, async (req, res) => {
   const jid = String(req.body?.jid || '');
   const id = String(req.body?.id || '');
+  const star = req.body?.star !== false;
   if (!jid || !id) return res.status(400).json({ error: 'jid_and_id_required' });
   if (!sock || status !== 'open') return res.status(409).json({ error: 'whatsapp_not_connected' });
   try {
     const targetJid = await resolveOutboundJid(jid);
-    const star = req.body?.star !== false;
-    await sock.chatModify({ star: { messages: [{ id, fromMe: req.body?.fromMe !== false }], star } }, targetJid);
-    res.json({ ok: true, starred: star, id });
+    await sock.chatModify({ star: { messages: [{ id, fromMe: true }], star } }, targetJid);
+    res.json({ ok: true });
   } catch (error) {
     res.status(502).json({ error: 'star_failed', message: error?.message || String(error) });
   }
-});
-
-// ===== KERO-PONTE-PARIDADE-31-10-20261105-v1: rotas restauradas da ponte de 31/10 =====
-app.get('/crm/media/raw', secure, async (req, res) => {
-  const raw = mediaRaw.get(String(req.query.id || '')) || lerMidiaDisco(String(req.query.id || ''));
-  if (!raw) return res.status(404).json({ ok: false, error: 'midia nao esta na memoria da ponte' });
-  try {
-    const m = raw.message || {};
-    const inner = m.ephemeralMessage?.message || m.viewOnceMessage?.message || m.viewOnceMessageV2?.message || m.documentWithCaptionMessage?.message || m;
-    const tipo = Object.keys(inner).find(k => /(image|video|audio|document|sticker)Message$/.test(k));
-    const buf = await downloadMediaMessage(raw, 'buffer', {}, { reuploadRequest: sock?.updateMediaMessage, logger: pino({ level: 'silent' }) });
-    res.set('Content-Type', inner[tipo]?.mimetype || 'application/octet-stream');
-    res.send(buf);
-  } catch (e) { res.status(502).json({ ok: false, error: String(e?.message || e).slice(0, 160) }); }
-});
-
-app.post('/crm/send-pix', secure, async (req, res) => {
-  if (process.env.KERO_PIX_LIBERADO !== '1') return res.status(423).json({ ok: false, error: 'ceo_pause_until_further_order', pulado: 'ceo-pause-pix', resume_requires: 'explicit_ceo_order' });
-  try {
-    res.json(await sendCrmPix(String(req.body?.jid || ''), req.body || {}));
-  } catch (error) {
-    console.error('[crm] send-pix failed', { message: error?.message || String(error) });
-    res.status(error?.message === 'whatsapp_not_connected' ? 409 : 502).json({ error: error?.message || 'whatsapp_send_failed' });
-  }
-});
-
-app.post('/crm/send-buttons', secure, async (req, res) => {
-  try { res.json(await sendCrmBotoes(String(req.body?.jid || ''), req.body || {})); }
-  catch (error) { console.error('[crm] send-buttons failed', { message: error?.message || String(error) }); res.status(error?.codigo || (error?.message === 'whatsapp_not_connected' ? 409 : 502)).json({ error: error?.message || 'whatsapp_send_failed' }); }
-});
-app.post('/crm/send-poll', secure, async (req, res) => {
-  try { res.json(await sendCrmEnquete(String(req.body?.jid || ''), req.body || {})); }
-  catch (error) { console.error('[crm] send-poll failed', { message: error?.message || String(error) }); res.status(error?.codigo || (error?.message === 'whatsapp_not_connected' ? 409 : 502)).json({ error: error?.message || 'whatsapp_send_failed' }); }
 });
 
 // CEO 26/10/2026: salvar contato na agenda do numero da Kero ("Motoboy Fabricio", "Cliente Joao - Empresa").
@@ -826,18 +884,18 @@ app.post('/crm/save-contact', secure, async (req, res) => {
   }
 });
 
-// CEO 09/11/2026: arquivar conversa PRIVADA depois de um envio (ex.: disparo Dunelli). Grupos nunca.
+// CEO 25/10/2026: toda O.S que a IA joga nos grupos fica FAVORITADA (estrela): se a IA falhar em apagar,
+// a equipe apaga para todos pela lista de Favoritos. star=false tira a estrela. So mensagem nossa (fromMe padrao true).
+// KERO 07/11/2026: segunda rota /crm/star (codigo morto, o Express usa a primeira) removida; backup server.mjs.bak-20261107-star-duplicada
+// CEO 06/11/2026: arquivar/desarquivar uma conversa PRIVADA (disparo Dunelli: manda e arquiva para nao poluir o atendimento).
+// Nunca grupos. archive=false desarquiva. Precisa da ultima mensagem da conversa (o WhatsApp exige).
 app.post('/crm/archive', secure, async (req, res) => {
   const jid = String(req.body?.jid || '');
   if (!jid || /@g\.us$/.test(jid)) return res.status(400).json({ error: 'jid_privado_required' });
   if (!sock || status !== 'open') return res.status(409).json({ error: 'whatsapp_not_connected' });
   try {
     const targetJid = await resolveOutboundJid(jid);
-    // CEO 09/11: quem acabou de enviar informa o id da propria mensagem (o historico local pode nao ter a conversa)
-    const idDado = /^[A-Za-z0-9_-]{8,128}$/.test(String(req.body?.id || '')) ? String(req.body.id) : null;
-    const tsDado = Number(req.body?.timestamp) > 1e9 ? Math.floor(Number(req.body.timestamp)) : Math.floor(Date.now() / 1000);
-    const ult = idDado ? { id: idDado, fromMe: true, timestamp: tsDado }
-      : ([targetJid, jid].flatMap(j => CRM.getMessages(j, { limit: 5 }).messages || []).sort((a, b) => Number(b.timestamp) - Number(a.timestamp)))[0];
+    const ult = ([targetJid, jid].flatMap(j => CRM.getMessages(j, { limit: 5 }).messages || []).sort((a, b) => Number(b.timestamp) - Number(a.timestamp)))[0];
     if (!ult) return res.status(422).json({ error: 'sem_mensagem', message: 'conversa sem mensagem salva' });
     const archive = req.body?.archive !== false;
     await sock.chatModify({ archive, lastMessages: [{ key: { remoteJid: targetJid, id: ult.id, fromMe: !!ult.fromMe }, messageTimestamp: Number(ult.timestamp) }] }, targetJid);
@@ -940,7 +998,7 @@ app.post('/connect/phone', secure, async (req, res) => {
 
 
 // KERO_MAINTENANCE_V1
-const TEMP_LABEL_NAMES = new Set(['📌Cliente do dia', '📌 Cliente do dia', 'Pagamento de Motoboy/Motorista']);
+const TEMP_LABEL_NAMES = new Set(['📌Cliente do dia', '📌 Cliente do dia', 'Cliente do dia', 'Pagamento de Motoboy/Motorista'] /* CEO 31/10: a etiqueta real e 'Cliente do dia' sem alfinete */);
 const CLIENT_GROUP_LABEL_NAME = 'Grupos com clientes';
 const PROFESSIONAL_LABEL_NAMES = new Set(['Grupos 1,50 km','Grupos 2,00 km','Carros & Utilitarios','Carros & Utilitários','Encaixe acima de 70km','Min 20$ até 6km']);
 const CLIENT_GROUP_PATTERNS = [
@@ -1012,38 +1070,46 @@ async function removeTemporaryLabels(dryRun=false){
 }
 // CEO 16/10/2026: clear ONLY the messages of archived groups; never delete/leave groups.
 const isArchivedGroup = g => !!g?.id?.endsWith('@g.us') && CRM.state.chats?.[g.id]?.archived === true;
-// KERO-LIMPEZA-ARQUIVADOS-20261109 (CEO 09/11): igual ao app "Limpar conversas" — limpa a conversa INTEIRA de cada grupo arquivado.
-// Antes: so limpava mensagens guardadas aqui, mas o store apaga as mensagens de conversa arquivada -> limpava 0 todo dia.
-// CEO 09/11 15h40: SO grupo de motoboy, motorista e localizacao (isProfessionalGroup: etiquetas 1,50/2,00/Min20/Carros/Encaixe ou nome).
-// Grupo com cliente NUNCA. Nunca tambem: Time Atendimento, SuperGrupo/Apoio, Reuniao de ADMs, Ensinamentos, etiqueta 'Grupos com
-// clientes' e grupo com disparo nosso nos ultimos 30 min. Nunca desarquiva, sai ou apaga grupo.
-const LIMPEZA_PROTEGIDOS = /time atendimento|supergrupo|apoio|reuniao de adms|ensinamentos/i;
-const temEtiquetaDeCliente = g => {
-  const byId = new Map(Object.values(CRM.state.labels || {}).filter(x=>!x.deleted).map(x=>[String(x.id), norm(x.name)]));
-  return (CRM.state.chatLabels?.[g.id] || []).map(id=>byId.get(String(id))).filter(Boolean).some(n=>/grupos? com clientes?/i.test(n));
-};
-function motivoParaNaoLimpar(g, agora=Date.now()){
-  if(LIMPEZA_PROTEGIDOS.test(norm(g?.subject))) return 'protegido';
-  if(temEtiquetaDeCliente(g)) return 'etiqueta_grupos_com_clientes';
-  if(!isProfessionalGroup(g)) return 'nao_e_grupo_de_motoboy';
-  if((CRM.state.keroSent?.[g.id] || []).some(m=>!m.deleted && agora - Number(m.timestamp)*1000 < 30*60e3)) return 'disparo_recente';
-  return null;
-}
+// 23/10/2026: limpa pelo horario de corte (como o archived-group-cleanup), sem depender das mensagens salvas
+// nesta ponte: a reserva nao guarda o historico antigo e o formato antigo {clear:{messages}} nao existe no Baileys 7.
 async function clearArchivedGroups(dryRun=false){
   const results=[];
+  const cutoff=Math.floor(Date.now()/1000)-1;
   for(const g of Object.values(CRM.state.groups||{})){
     if(!isArchivedGroup(g)) continue;
-    const pulo=motivoParaNaoLimpar(g);
-    if(pulo){results.push({id:g.id,name:g.subject,cleared:0,skipped:pulo});continue;}
+    // CEO 27/10/2026: so grupos de motoboys/motoristas/interior. Nunca o Time de Atendimento da Kero, apoio ou ADMs.
+    if(/atendimento|apoio|\badms?\b|reuni[aã]o|ensinament/i.test(String(g.subject||CRM.state.chats?.[g.id]?.name||''))){ results.push({id:g.id,name:g.subject,cleared:0,skipped:'excluido'}); continue; }
+    const msgs=(CRM.getMessages(g.id,{limit:500}).messages||[]).filter(m=>!m.deleted);
+    // Victoria disparando servico nesse grupo (mensagem nossa nas ultimas 2 h) -> nao limpa hoje
+    if(CRM.osArquivadas().some(o=>o.jid===g.id && Date.now()/1000-Number(o.timestamp)<2*3600) || msgs.some(m=>m.fromMe && Date.now()/1000-Number(m.timestamp)<2*3600)){ results.push({id:g.id,name:g.subject,cleared:0,skipped:'disparo_recente'}); continue; }
     if(!dryRun){
-      try { await sock.chatModify({ clear:true }, g.id); }
-      catch(error){ results.push({id:g.id,name:g.subject,cleared:0,error:String(error?.message||error).slice(0,80)}); continue; }
-      await sleep(400);
+      try{
+        await sock.chatModify({ clear:true, lastMessages:{ lastMessageTimestamp:cutoff, lastSystemMessageTimestamp:cutoff } }, g.id);
+      }catch(error){ results.push({id:g.id,name:g.subject,cleared:0,error:String(error?.message||error).slice(0,120)}); continue; }
+      await sleep(1000);
     }
-    results.push({id:g.id,name:g.subject,cleared:1});
+    results.push({id:g.id,name:g.subject,cleared:msgs.length});
   }
   return results;
 }
+// CEO 27/10/2026: limpa a conversa SO dos grupos indicados pelo atendente (motoboys/motoristas/interior), e so se o grupo
+// estiver ARQUIVADO. Nunca desarquiva, apaga, sai do grupo nem escreve nada. Quem escolhe a lista e o atendente (exclui o Time de
+// Atendimento e confere se a Victoria nao esta disparando).
+app.post('/crm/archived-groups/clear/selected', secure, async (req,res)=>{
+  try{
+    if(req.body?.confirm!=='LIMPAR_SO_ARQUIVADOS' || !Array.isArray(req.body?.jids)) return res.status(400).json({error:'invalid_request'});
+    if(!sock || status!=='open') return res.status(412).json({error:'whatsapp_not_connected'});
+    const cutoff=Math.floor(Date.now()/1000)-1, out=[];
+    for(const jid of req.body.jids.slice(0,200)){
+      const g=CRM.state.groups?.[jid]||{id:jid};
+      if(!String(jid).endsWith('@g.us') || !isArchivedGroup({...g,id:jid})){ out.push({jid,skipped:'nao_arquivado'}); continue; }
+      try{ await sock.chatModify({ clear:true, lastMessages:{ lastMessageTimestamp:cutoff, lastSystemMessageTimestamp:cutoff } }, jid); out.push({jid,cleared:true}); }
+      catch(error){ out.push({jid,error:String(error?.message||error).slice(0,120)}); }
+      await sleep(800);
+    }
+    res.json({ok:true,cutoff,results:out});
+  }catch(error){ res.status(500).json({error:'clear_failed',message:String(error?.message||error).slice(0,200)}); }
+});
 async function runKeroMaintenance({dryRun=false}={}){
   // Opt-in only: never clear messages or mutate labels by accident.
   if (!dryRun && process.env.CRM_ALLOW_DESTRUCTIVE_MAINTENANCE !== '1') throw new Error('destructive_maintenance_disabled');
@@ -1057,6 +1123,7 @@ async function runKeroMaintenance({dryRun=false}={}){
   if(!dryRun){maintenanceState.lastRun=result.at;maintenanceState.lastResult=result;saveMaintenance();}
   return result;
 }
+app.get('/crm/os-arquivadas', secure, (_req,res)=>res.json({ok:true,os:CRM.osArquivadas().map(o=>({...o,grupo:CRM.state.groups?.[o.jid]?.subject||''}))}));
 app.get('/crm/maintenance/status', secure, (_req,res)=>res.json({ok:true,state:maintenanceState}));
 app.post('/crm/maintenance/run', secure, async (req,res)=>{
   try { res.json({ok:true,result:await runKeroMaintenance({dryRun:!!req.body?.dryRun})}); }
@@ -1098,7 +1165,7 @@ if (process.env.WA_OUTBOX_ENABLED === '1' && (outboxOnCloudflare || (process.env
         return { messageId: 'presence:composing' };
       }
       const sent = await sock.sendMessage(targetJid, { text });
-      if (sent) { marcarOrigem(sent); CRM.upsertMessage(sent); }
+      if (sent) CRM.upsertMessage(sent);
       await sock.sendPresenceUpdate('paused', targetJid).catch(() => null);
       return { messageId: sent?.key?.id || null };
     }
